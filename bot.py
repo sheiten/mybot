@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import os
+import httpx  # <--- ДОБАВИТЬ ЭТО
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import aiohttp
