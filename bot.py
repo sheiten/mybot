@@ -87,7 +87,10 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(text, parse_mode='HTML')
 
 def main() -> None:
-    application = Application.builder().token(TOKEN).build()
+    # Увеличиваем таймауты для стабильной работы через прокси
+    request = httpx.Request(connect_timeout=30.0, read_timeout=30.0)
+    application = Application.builder().token(TOKEN).request(request).build()
+    
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('proxy', proxy_command))
     application.add_handler(CommandHandler('list', list_command))
