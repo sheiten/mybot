@@ -6,7 +6,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 import aiohttp
 
 # 🔧 НАСТРОЙКИ
-TOKEN = "СЮДА_ВАШ_НОВЫЙ_ТОКЕН"  # Замените на новый токен от @BotFather
+import os
+TOKEN = os.environ.get("BOT_TOKEN", "")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is not set!")
 
 # Ссылки на актуальные списки прокси (обновляются каждые 4 часа)
 URLS = {
