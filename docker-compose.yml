@@ -5,10 +5,13 @@ services:
     image: python:3.12-slim
     container_name: telegram-proxy-bot
     restart: unless-stopped
-    network_mode: host # <--- ДОБАВИТЬ ЭТО
     working_dir: /app
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
+      # ЯВНО указываем боту идти через SOCKS5 прокси вашего Xray
+      # host.docker.internal - это IP вашего сервера изнутри контейнера
+      # 1080 - стандартный порт SOCKS5 в Amnezia (замените на свой, если другой)
+      - ALL_PROXY=socks5://host.docker.internal:1080
     command: >
       sh -c "
       apt-get update && apt-get install -y curl &&
