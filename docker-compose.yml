@@ -1,0 +1,6 @@
+version: '3.8'
+services:
+  proxybot:
+    build: .
+    container_name: telegram-proxy-bot
+    restart: unless-stopped
