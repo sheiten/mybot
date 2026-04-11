@@ -49,10 +49,10 @@ async def fetch_proxies(url: str) -> list:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        '🛡️ Бот для получения MTProto прокси с Fake TLS.\\n\\n'
-        'Команды:\\n'
-        '/proxy [ru|eu|all] — одна случайная ссылка\\n'
-        '/list [N] [ru|eu|all] — список из N прокси\\n\\n'
+        '🛡️ Бот для получения MTProto прокси с Fake TLS.\n\n'
+        'Команды:\n'
+        '/proxy [ru|eu|all] — одна случайная ссылка\n'
+        '/list [N] [ru|eu|all] — список из N прокси\n\n'
         'Источник: kort0881/telegram-proxy-collector'
     )
 
@@ -88,7 +88,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if count > len(proxies):
         count = len(proxies)
     selected = random.sample(proxies, count)
-    text = '\\n'.join([f'{i+1}. `{p}`' for i, p in enumerate(selected)])
+    text = '\n'.join([f'{i+1}. `{p}`' for i, p in enumerate(selected)])
     await update.message.reply_text(text, parse_mode='Markdown')
 
 def main() -> None:
