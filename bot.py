@@ -87,16 +87,30 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = '\n'.join([f'{i+1}. <code>{p}</code>' for i, p in enumerate(selected)])
     await update.message.reply_text(text, parse_mode='HTML')
 
+import httpx  # Убедитесь, что этот импорт есть в начале файла
+
 def main() -> None:
-    # Увеличиваем таймауты для стабильной работы через прокси
-    request = httpx.Request(connect_timeout=30.0, read_timeout=30.0)
-    application = Application.builder().token(TOKEN).request(request).build()
+    # 1. Создаем клиент httpx с ЯВНЫМ указанием прокси и увеличенными таймаутами
+    # ЗАМЕНИТЕ 172.17.0.1 НА ВАШ IP ИЗ ШАГА 1 (ip addr show docker0)
+    # ЗАМЕНИТЕ 1080 НА ВАШ ПОРТ SOCKS5 ИЗ AMNEZIA/XRAY
+    proxy_url = "socks5://172.17.0.1:1080" 
+    
+    # Если Xray работает как HTTP прокси, раскомментируйте строку ниже и закомментируйте строку выше:
+    # proxy_url = "http://172.17.0.1:10809"
+
+    custom_client = httpx.AsyncClient(
+        proxy=proxy_url,
+        timeout=httpx.Timeout(30.0, connect=30.0) # Увеличенные таймауты
+    )
+    
+    # 2. Передаем этот клиент в настройки запросов Telegram
+    request_params = telegram.request.RequestData(client=custom_client)
+
+    # 3. Собираем бота
+    application = Application.builder().token(TOKEN).request(request_params).build()
     
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('proxy', proxy_command))
     application.add_handler(CommandHandler('list', list_command))
     logging.info('Бот запущен...')
     application.run_polling()
-
-if __name__ == '__main__':
-    main()
