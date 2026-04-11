@@ -2,14 +2,11 @@ version: '3.8'
 
 services:
   proxybot:
-    image: python:3.12-slim
+    build: .
+    image: mybot:latest
     container_name: telegram-proxy-bot
     restart: unless-stopped
-    working_dir: /app
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
-      # Раскомментируйте строку ниже и впишите ваш прокси, если он есть на сервере:
+      # Если нужен прокси для доступа к API Telegram, раскомментируйте:
       # - PROXY_URL=socks5://172.17.0.1:1080
-    volumes:
-      - ./bot.py:/app/bot.py # Привязываем локальный файл к контейнеру
-    command: sh -c "pip install --no-cache-dir python-telegram-bot aiohttp httpx && python /app/bot.py"
