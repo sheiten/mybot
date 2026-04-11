@@ -8,14 +8,10 @@ services:
     working_dir: /app
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
-      # ЯВНО указываем боту идти через SOCKS5 прокси вашего Xray
-      # host.docker.internal - это IP вашего сервера изнутри контейнера
-      # 1080 - стандартный порт SOCKS5 в Amnezia (замените на свой, если другой)
-      - ALL_PROXY=socks5://host.docker.internal:1080
     command: >
       sh -c "
       apt-get update && apt-get install -y curl &&
-      pip install --no-cache-dir python-telegram-bot aiohttp &&
+      pip install --no-cache-dir python-telegram-bot aiohttp httpx &&
       curl -sL https://raw.githubusercontent.com/sheiten/mybot/main/bot.py -o /app/bot.py &&
       python /app/bot.py
       "
