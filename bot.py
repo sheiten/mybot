@@ -21,7 +21,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 async def fetch_proxies(url: str) -> list:
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     text = await response.text()
                     proxies = [line.strip() for line in text.splitlines() if line.strip().startswith('tg://')]
@@ -43,20 +43,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # По умолчанию 'ru', если аргументов нет или они некорректны
     region = 'ru'
     if context.args and context.args[0].lower() in URLS:
         region = context.args[0].lower()
+        
     await update.message.reply_text(f'🔄 Загружаю {region.upper()}...')
     proxies = await fetch_proxies(URLS[region])
     if not proxies:
         await update.message.reply_text('❌ Не удалось загрузить прокси.')
         return
+    
     chosen = random.choice(proxies)
-    await update.message.reply_text(f'`{chosen}`', parse_mode='Markdown')
+    # Используем HTML вместо Markdown, чтобы избежать ошибок парсинга спецсимволов в ссылках
+    await update.message.reply_text(f'<code>{chosen}</code>', parse_mode='HTML')
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     count, region = 3, 'ru'
-    args = context.args
+    args = context.args if context.args else []
+    
     if args:
         try:
             count = int(args[0])
@@ -66,16 +71,20 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except ValueError:
             if args[0].lower() in URLS:
                 region = args[0].lower()
+                
     await update.message.reply_text(f'🔄 Загружаю {count} прокси из {region.upper()}...')
     proxies = await fetch_proxies(URLS[region])
     if not proxies:
         await update.message.reply_text('❌ Не удалось загрузить прокси.')
         return
+        
     if count > len(proxies):
         count = len(proxies)
+        
     selected = random.sample(proxies, count)
-    text = '\n'.join([f'{i+1}. `{p}`' for i, p in enumerate(selected)])
-    await update.message.reply_text(text, parse_mode='Markdown')
+    # Используем HTML <code> для надежного отображения ссылок
+    text = '\n'.join([f'{i+1}. <code>{p}</code>' for i, p in enumerate(selected)])
+    await update.message.reply_text(text, parse_mode='HTML')
 
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
