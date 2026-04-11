@@ -2,7 +2,7 @@ import asyncio
 import logging
 import random
 import os
-import httpx  # <--- ДОБАВИТЬ ЭТО
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import aiohttp
@@ -44,7 +44,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # По умолчанию 'ru', если аргументов нет или они некорректны
     region = 'ru'
     if context.args and context.args[0].lower() in URLS:
         region = context.args[0].lower()
@@ -56,7 +55,6 @@ async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     chosen = random.choice(proxies)
-    # Используем HTML вместо Markdown, чтобы избежать ошибок парсинга спецсимволов в ссылках
     await update.message.reply_text(f'<code>{chosen}</code>', parse_mode='HTML')
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -83,34 +81,30 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         count = len(proxies)
         
     selected = random.sample(proxies, count)
-    # Используем HTML <code> для надежного отображения ссылок
     text = '\n'.join([f'{i+1}. <code>{p}</code>' for i, p in enumerate(selected)])
     await update.message.reply_text(text, parse_mode='HTML')
 
-import httpx  # Убедитесь, что этот импорт есть в начале файла
-
 def main() -> None:
-    # 1. Создаем клиент httpx с ЯВНЫМ указанием прокси и увеличенными таймаутами
-    # ЗАМЕНИТЕ 172.17.0.1 НА ВАШ IP ИЗ ШАГА 1 (ip addr show docker0)
-    # ЗАМЕНИТЕ 1080 НА ВАШ ПОРТ SOCKS5 ИЗ AMNEZIA/XRAY
-    proxy_url = "socks5://172.17.0.1:1080" 
+    # Настройка прокси (оставьте пустым, если прокси на сервере нет)
+    PROXY_URL = os.environ.get('PROXY_URL', '') 
     
-    # Если Xray работает как HTTP прокси, раскомментируйте строку ниже и закомментируйте строку выше:
-    # proxy_url = "http://172.17.0.1:10809"
-
-    custom_client = httpx.AsyncClient(
-        proxy=proxy_url,
-        timeout=httpx.Timeout(30.0, connect=30.0) # Увеличенные таймауты
-    )
+    builder = Application.builder().token(TOKEN)
     
-    # 2. Передаем этот клиент в настройки запросов Telegram
-    request_params = telegram.request.RequestData(client=custom_client)
+    if PROXY_URL:
+        try:
+            custom_client = httpx.AsyncClient(proxy=PROXY_URL, timeout=httpx.Timeout(30.0, connect=30.0))
+            builder = builder.request(httpx.AsyncClient(proxy=PROXY_URL))
+            logging.info(f"Бот использует прокси: {PROXY_URL}")
+        except Exception as e:
+            logging.error(f"Ошибка настройки прокси: {e}")
 
-    # 3. Собираем бота
-    application = Application.builder().token(TOKEN).request(request_params).build()
+    application = builder.build()
     
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('proxy', proxy_command))
     application.add_handler(CommandHandler('list', list_command))
     logging.info('Бот запущен...')
     application.run_polling()
+
+if __name__ == '__main__':
+    main()
