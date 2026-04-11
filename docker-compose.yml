@@ -6,6 +6,8 @@ services:
     container_name: telegram-proxy-bot
     restart: unless-stopped
     working_dir: /app
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}  # Берёт значение из переменной окружения стека
     command: >
       sh -c "
       pip install --no-cache-dir python-telegram-bot aiohttp &&
