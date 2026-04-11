@@ -8,10 +8,8 @@ services:
     working_dir: /app
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
-    command: >
-      sh -c "
-      apt-get update && apt-get install -y curl &&
-      pip install --no-cache-dir python-telegram-bot aiohttp httpx &&
-      curl -sL https://raw.githubusercontent.com/sheiten/mybot/main/bot.py -o /app/bot.py &&
-      python /app/bot.py
-      "
+      # Раскомментируйте строку ниже и впишите ваш прокси, если он есть на сервере:
+      # - PROXY_URL=socks5://172.17.0.1:1080
+    volumes:
+      - ./bot.py:/app/bot.py # Привязываем локальный файл к контейнеру
+    command: sh -c "pip install --no-cache-dir python-telegram-bot aiohttp httpx && python /app/bot.py"
