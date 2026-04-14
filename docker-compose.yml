@@ -3,7 +3,6 @@ version: '3.8'
 services:
   proxybot:
     build: .
-    image: mybot:latest
     container_name: telegram-proxy-bot
     restart: unless-stopped
     environment:
