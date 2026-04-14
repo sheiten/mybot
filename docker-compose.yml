@@ -7,5 +7,5 @@ services:
     restart: unless-stopped
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
-      # Если нужен прокси для доступа к API Telegram, раскомментируйте:
+      # Если вдруг нужен прокси для доступа к API Telegram, раскомментируйте:
       # - PROXY_URL=socks5://172.17.0.1:1080
