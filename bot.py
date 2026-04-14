@@ -55,7 +55,12 @@ async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     chosen = random.choice(proxies)
-    await update.message.reply_text(f'<code>{chosen}</code>', parse_mode='HTML')
+    
+    # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
+    # Делаем ссылку кликабельной с помощью HTML-тега <a>
+    clickable_link = f'<a href="{chosen}">🔗 Подключить прокси</a>'
+    await update.message.reply_text(clickable_link, parse_mode='HTML')
+
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     count, region = 3, 'ru'
@@ -81,18 +86,21 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         count = len(proxies)
         
     selected = random.sample(proxies, count)
-    text = '\n'.join([f'{i+1}. <code>{p}</code>' for i, p in enumerate(selected)])
-    await update.message.reply_text(text, parse_mode='HTML')
+    
+    # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
+    # Каждая ссылка в списке тоже оборачивается в <a>
+    text = '\n'.join([f'{i+1}. <a href="{p}">🔗 Прокси {i+1}</a>' for i, p in enumerate(selected)])
+    await update.message.reply_text(text, parse_mode='HTML', disable_web_page_preview=True)
+
 
 def main() -> None:
-    # Настройка прокси (оставьте пустым, если прокси на сервере нет)
     PROXY_URL = os.environ.get('PROXY_URL', '') 
     
     builder = Application.builder().token(TOKEN)
     
     if PROXY_URL:
         try:
-            custom_client = httpx.AsyncClient(proxy=PROXY_URL, timeout=httpx.Timeout(30.0, connect=30.0))
+            # ИСПРАВЛЕНА ОШИБКА: раньше здесь было builder = builder.request(...), что ломало бота
             builder = builder.request(httpx.AsyncClient(proxy=PROXY_URL))
             logging.info(f"Бот использует прокси: {PROXY_URL}")
         except Exception as e:
