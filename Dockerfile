@@ -1,11 +1,17 @@
 FROM python:3.12-slim
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y curl && \
-    pip install --no-cache-dir python-telegram-bot aiohttp httpx
+# Системные библиотеки, необходимые для opencv-python-headless
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Вместо RUN curl используем COPY. 
-# Docker сам увидит, если файл bot.py на гитхабе изменился, и обновит слой.
+# Копируем requirements.txt и устанавливаем все зависимости
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем код бота
 COPY bot.py .
 
 CMD ["python", "bot.py"]
