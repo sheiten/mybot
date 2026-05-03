@@ -47,7 +47,8 @@ def load_font(size: int):
         try:
             return ImageFont.truetype(path, size)
         except (OSError, IOError):
-            continue    return ImageFont.load_default()
+            continue
+            return ImageFont.load_default()
 
 
 # === ОБРАБОТКА ИЗОБРАЖЕНИЙ ===
