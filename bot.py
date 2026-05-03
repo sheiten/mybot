@@ -47,14 +47,19 @@ def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> n
 def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, List[Tuple[int, int, int]], np.ndarray]:
     h, w, c = img_array.shape
     pixels = img_array.reshape(-1, c)
-    kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10)    labels = kmeans.fit_predict(pixels)
+        kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(pixels)
     centers = kmeans.cluster_centers_.astype(np.uint8)
+    
     quantized = centers[labels].reshape(h, w, c)
+    
     brightness = [np.mean(color) for color in centers]
     sorted_indices = np.argsort(brightness)
     centers_sorted = centers[sorted_indices]
+    
     label_map = {old: new for new, old in enumerate(sorted_indices)}
     labels_mapped = np.array([label_map[l] for l in labels]).reshape(h, w)
+    
     return quantized.astype(np.uint8), [tuple(c) for c in centers_sorted], labels_mapped
 
 
@@ -71,6 +76,7 @@ def find_regions(labels: np.ndarray, min_size: int = MIN_REGION_SIZE) -> List[di
                 region_pixels = []
                 queue = [(y, x)]
                 visited[y, x] = True
+                
                 while queue:
                     cy, cx = queue.pop(0)
                     region_pixels.append((cy, cx))
@@ -85,18 +91,19 @@ def find_regions(labels: np.ndarray, min_size: int = MIN_REGION_SIZE) -> List[di
                     ys, xs = zip(*region_pixels)
                     bbox = (min(xs), min(ys), max(xs), max(ys))
                     center = (np.mean(xs), np.mean(ys))
+                    
                     contour_pixels = []
                     for py, px in region_pixels:
                         is_border = False
                         for dy, dx in directions:
-                            ny, nx = py + dy, px + dx
-                            if (0 <= ny < h and 0 <= nx < w and labels[ny, nx] != color):
+                            ny, nx = py + dy, px + dx                            if (0 <= ny < h and 0 <= nx < w and labels[ny, nx] != color):
                                 is_border = True
                                 break
                         if is_border:
                             contour_pixels.append((px, py))
                     
-                    regions.append({                        'color_idx': int(color),
+                    regions.append({
+                        'color_idx': int(color),
                         'pixels': region_pixels,
                         'contour': contour_pixels,
                         'center': center,
@@ -140,12 +147,13 @@ def create_coloring_page(width: int, height: int, regions: List[dict], palette: 
     
     return coloring, palette_img
 
-
 def process_image_for_coloring(photo_bytes: bytes, n_colors: int = DEFAULT_N_COLORS) -> Tuple[io.BytesIO, io.BytesIO]:
     image = Image.open(io.BytesIO(photo_bytes))
     img_array = preprocess_image(image)
     h, w = img_array.shape[:2]
-    _, palette, labels = cluster_colors(img_array, n_colors)    regions = find_regions(labels)
+    
+    _, palette, labels = cluster_colors(img_array, n_colors)
+    regions = find_regions(labels)
     coloring_img, palette_img = create_coloring_page(w, h, regions, palette)
     
     coloring_buffer = io.BytesIO()
@@ -186,15 +194,15 @@ async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f'✅ Установлено {n_colors} цветов 🎨')
 
 
-async def set_minsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or not context.args[0].isdigit():
+async def set_minsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:    if not context.args or not context.args[0].isdigit():
         await update.message.reply_text('❌ Использование: <code>/minsize 50</code> (20-500)', parse_mode='HTML')
         return
     min_size = int(context.args[0])
     if not 20 <= min_size <= 500:
         await update.message.reply_text('❌ Число должно быть от 20 до 500', parse_mode='HTML')
         return
-    context.user_data['min_size'] = min_size    await update.message.reply_text(f'✅ Мин. размер области: {min_size} пикселей')
+    context.user_data['min_size'] = min_size
+    await update.message.reply_text(f'✅ Мин. размер области: {min_size} пикселей')
 
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -235,7 +243,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # === ЗАПУСК ===
-
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
     
@@ -243,7 +250,8 @@ def main() -> None:
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('colors', set_colors))
     application.add_handler(CommandHandler('minsize', set_minsize))
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))    
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
+    
     logger.info('🎨 Бот запущен!')
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
