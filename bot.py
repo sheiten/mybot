@@ -195,7 +195,8 @@ def create_coloring_page(width: int, height: int, regions: List[dict], palette: 
 
 
 def process_image_for_coloring(photo_bytes: bytes, n_colors: int = DEFAULT_N_COLORS) -> Tuple[io.BytesIO, io.BytesIO]:
-    """Основная функция обработки изображения в раскраску."""    image = Image.open(io.BytesIO(photo_bytes))
+    """Основная функция обработки изображения в раскраску."""
+    image = Image.open(io.BytesIO(photo_bytes))
     img_array = preprocess_image(image)
     h, w = img_array.shape[:2]
     
