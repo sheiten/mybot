@@ -16,7 +16,6 @@ TOKEN = os.environ.get('BOT_TOKEN', '')
 if not TOKEN:
     raise ValueError('BOT_TOKEN environment variable is not set!')
 
-# Параметры обработки
 DEFAULT_N_COLORS = 12
 MIN_REGION_SIZE = 100
 MAX_IMAGE_SIZE = 1000
@@ -47,8 +46,8 @@ def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> n
 def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, List[Tuple[int, int, int]], np.ndarray]:
     h, w, c = img_array.shape
     pixels = img_array.reshape(-1, c)
-        kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(pixels)
+    
+    kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10)    labels = kmeans.fit_predict(pixels)
     centers = kmeans.cluster_centers_.astype(np.uint8)
     
     quantized = centers[labels].reshape(h, w, c)
@@ -96,8 +95,8 @@ def find_regions(labels: np.ndarray, min_size: int = MIN_REGION_SIZE) -> List[di
                     for py, px in region_pixels:
                         is_border = False
                         for dy, dx in directions:
-                            ny, nx = py + dy, px + dx                            if (0 <= ny < h and 0 <= nx < w and labels[ny, nx] != color):
-                                is_border = True
+                            ny, nx = py + dy, px + dx
+                            if (0 <= ny < h and 0 <= nx < w and labels[ny, nx] != color):                                is_border = True
                                 break
                         if is_border:
                             contour_pixels.append((px, py))
@@ -126,7 +125,7 @@ def create_coloring_page(width: int, height: int, regions: List[dict], palette: 
     
     try:
         font = ImageFont.truetype("arial.ttf", FONT_SIZE)
-    except:
+    except Exception:
         font = ImageFont.load_default()
     
     for idx, region in enumerate(regions, start=1):
@@ -194,8 +193,8 @@ async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f'✅ Установлено {n_colors} цветов 🎨')
 
 
-async def set_minsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ Использование: <code>/minsize 50</code> (20-500)', parse_mode='HTML')
+async def set_minsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args or not context.args[0].isdigit():        await update.message.reply_text('❌ Использование: <code>/minsize 50</code> (20-500)', parse_mode='HTML')
         return
     min_size = int(context.args[0])
     if not 20 <= min_size <= 500:
@@ -243,8 +242,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # === ЗАПУСК ===
-def main() -> None:
-    application = Application.builder().token(TOKEN).build()
+
+def main() -> None:    application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
