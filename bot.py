@@ -244,15 +244,17 @@ async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     context.user_data['n_colors'] = n_colors
     await update.message.reply_text(f'✅ Установлено {n_colors} цветов 🎨')
 
-
-async def set_minsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:    """Установка минимального размера области."""
+async def set_minsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Установка минимального размера области."""
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text('❌ Использование: <code>/minsize 50</code> (20-500)', parse_mode='HTML')
         return
+        
     min_size = int(context.args[0])
     if not 20 <= min_size <= 500:
         await update.message.reply_text('❌ Число должно быть от 20 до 500', parse_mode='HTML')
         return
+        
     context.user_data['min_size'] = min_size
     await update.message.reply_text(f'✅ Мин. размер области: {min_size} пикселей')
 
