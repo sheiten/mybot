@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import io
-import math
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -15,7 +14,7 @@ TOKEN = os.environ.get('BOT_TOKEN', '')
 if not TOKEN:
     raise ValueError('BOT_TOKEN environment variable is not set!')
 
-# Настройки "фабричного" вида
+# Настройки
 MAX_IMAGE_SIZE = 1000
 MIN_REGION_AREA = 250
 NUM_COLORS = 24
@@ -28,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
-    """Упрощение изображения (эффект пластилина)"""
+    """Упрощение изображения"""
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
@@ -39,112 +38,167 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
     
     img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     
-    # Убираем шум
+    # Билатеральный фильтр убирает мелкие детали, сохраняя края
     img_bgr = cv2.bilateralFilter(img_bgr, 9, 75, 75)
-    # Группируем пиксели в цветовые пятна
-    shifted = cv2.pyrMeanShiftFiltering(img_bgr, 10, 30)
-    # Сглаживаем края
-    return cv2.medianBlur(shifted, 5)
+    # Легкое размытие для помощи K-means
+    img_bgr = cv2.GaussianBlur(img_bgr, (3, 3), 0)
+    
+    return img_bgr
 
 
 def apply_kmeans(img_bgr: np.ndarray, num_colors: int):
-    """Квантование (подбор палитры)"""
+    """Квантование с очисткой от шума (секрет плавных зон)"""
+    h, w = img_bgr.shape[:2]
     pixels = img_bgr.reshape((-1, 3))
+    
     kmeans = KMeans(n_clusters=num_colors, n_init=10, random_state=42)
     labels = kmeans.fit_predict(pixels)
     centers = kmeans.cluster_centers_.astype("uint8")
-    quantized = centers[labels].reshape(img_bgr.shape)
+    
+    # МАГИЯ ФАБРИЧНОГО КАЧЕСТВА: медианный фильтр НА МЕТКАХ, а не на пикселях.
+    # Это убирает эффект "соли и перца" (одиночные пиксели другого цвета)
+    labels_2d = labels.reshape(h, w).astype(np.uint8)
+    labels_clean = cv2.medianBlur(labels_2d, 5)
+    
+    quantized = centers[labels_clean].reshape(img_bgr.shape)
     return quantized, centers
 
 
-def create_coloring_page(quantized, centers, min_region_size=150):
-    # Теперь функция принимает 3 аргумента, ошибка TypeError исчезнет
+def create_coloring_page(quantized: np.ndarray, centers: np.ndarray, min_region_size: int = 150):
+    """Создание контурной карты фабричного качества"""
     h, w = quantized.shape[:2]
     
-    # 1. Сглаживание чуть меньше (5 вместо 7), чтобы оставить детали
-    cleaned = cv2.medianBlur(quantized, 5)
+    # Используем PIL для антиалиасинга (гладких линий)
+    canvas = Image.new('RGB', (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
     
-    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
-    
+    # Пытаемся загрузить красивый шрифт, если есть
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+        font_small = ImageFont.truetype("DejaVuSans.ttf", 10)
+    except IOError:
+        font = ImageFont.load_default()
+        font_small = font
+
     for i, color in enumerate(centers):
-        mask = cv2.inRange(cleaned, color, color)
-        # Находим контуры (TC89_L1 лучше сохраняет форму деталей)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)
+        # 1. Создаем маску цвета
+        mask = cv2.inRange(quantized, color, color)
         
-        for cnt in contours:
+        # 2. Морфологическое замыкание (убирает микро-дырки и соединяет разорванные линии)
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        
+        # 3. Ищем контуры С ИЕРАРХИЕЙ (чтобы были глаза, рот, внутренние детали)
+        contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if hierarchy is None:
+            continue
+            
+        hierarchy = hierarchy[0]
+        
+        for j, cnt in enumerate(contours):
             area = cv2.contourArea(cnt)
-            # Используем min_region_size, который пришел из вызова
             if area < min_region_size:
                 continue
             
-            # 2. Аппроксимация (0.001 — очень точное следование контуру)
-            epsilon = 0.001 * cv2.arcLength(cnt, True)
+            # 4. ПЛАВНОСТЬ ЛИНИЙ: Адаптивная аппроксимация. 
+            # 0.008 дает идеальные плавные кривые вместо зубчатых пикселей
+            perimeter = cv2.arcLength(cnt, True)
+            epsilon = 0.008 * perimeter
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             
-            # Рисуем контур (чуть темнее серый)
-            cv2.drawContours(canvas, [approx], -1, (160, 160, 160), 1)
+            # Конвертируем контур в список кортежей для PIL
+            pil_contour = [tuple(pt[0]) for pt in approx]
             
-            # 3. Умный шрифт (уменьшаем, чтобы влез в детали)
-            M = cv2.moments(approx)
-            if M["m00"] != 0:
-                cX, cY = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+            if len(pil_contour) < 3:
+                continue
                 
-                # Шрифт теперь совсем мелкий для маленьких деталей
-                font_scale = 0.25 if area < 1000 else 0.4
-                
-                if cv2.pointPolygonTest(approx, (cX, cY), False) >= 0:
-                    label = str(i + 1)
-                    (t_w, t_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-                    cv2.putText(canvas, label, (cX - t_w//2, cY + t_h//2),
-                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (80, 80, 80), 1)
+            # Рисуем контур (фабричная толщина - 2 пикселя, черный цвет)
+            is_hole = hierarchy[j][3] != -1
+            line_width = 2 if not is_hole else 1 # Внутренние детали чуть тоньше
+            draw.line(pil_contour + [pil_contour[0]], fill=(0, 0, 0), width=line_width)
+            
+            # 5. УМНОЕ РАЗМЕЩЕНИЕ ЦИФР
+            # Ставим цифру только на внешних контурах (не в дырках)
+            if not is_hole:
+                M = cv2.moments(approx)
+                if M["m00"] != 0:
+                    cX = int(M["m10"] / M["m00"])
+                    cY = int(M["m01"] / M["m00"])
+                    
+                    # Проверяем, что центр точно внутри многоугольника
+                    if cv2.pointPolygonTest(approx, (cX, cY), False) >= 0:
+                        label = str(i + 1)
+                        
+                        # Выбираем размер шрифта в зависимости от площади
+                        current_font = font if area > 1500 else font_small
+                        
+                        # Вычисляем размер текста для идеального центрирования
+                        bbox = draw.textbbox((0, 0), label, font=current_font)
+                        t_w = bbox[2] - bbox[0]
+                        t_h = bbox[3] - bbox[1]
+                        
+                        draw.text(
+                            (cX - t_w / 2, cY - t_h / 2), 
+                            label, 
+                            fill=(60, 60, 60), 
+                            font=current_font
+                        )
                             
-    return canvas
+    return np.array(canvas)
 
 
-
-def create_palette_image(centers: np.ndarray, width: int) -> np.ndarray:
-    """Создание изображения палитры"""
+def create_palette_image(centers: np.ndarray, width: int) -> Image.Image:
+    """Создание красивой палитры через PIL"""
     n_colors = len(centers)
     palette_height = 80
-    bar = np.ones((palette_height, width, 3), dtype=np.uint8) * 255
-    swatch_w = width // n_colors
+    palette = Image.new('RGB', (width, palette_height), (255, 255, 255))
+    draw = ImageDraw.Draw(palette)
     
+    swatch_w = width // n_colors
+    margin = 4
+    
+    # Пытаемся использовать тот же шрифт
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 12)
+    except IOError:
+        font = ImageFont.load_default()
+
     for i, color in enumerate(centers):
         x_start = i * swatch_w
         
-        # Цветной квадрат
-        cv2.rectangle(bar, (x_start + 4, 10), (x_start + swatch_w - 4, 50),
-                     color.tolist(), -1)
-        cv2.rectangle(bar, (x_start + 4, 10), (x_start + swatch_w - 4, 50),
-                     (180, 180, 180), 1)
+        # Рисуем квадратик цвета с скругленными углами (эмуляция)
+        x1, y1 = x_start + margin, 10
+        x2, y2 = x_start + swatch_w - margin, 50
         
-        # Номер
-        cv2.putText(bar, str(i + 1), (x_start + swatch_w // 2 - 5, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+        draw.rectangle([x1, y1, x2, y2], fill=color.tolist(), outline=(180, 180, 180), width=1)
+        
+        # Номер под квадратом
+        label = str(i + 1)
+        bbox = draw.textbbox((0, 0), label, font=font)
+        t_w = bbox[2] - bbox[0]
+        text_x = x_start + swatch_w // 2 - t_w // 2
+        
+        draw.text((text_x, 58), label, fill=(0, 0, 0), font=font)
     
-    return bar
+    return palette
 
 
 def process_image_for_coloring(photo_bytes: bytes, n_colors: int = DEFAULT_N_COLORS,
                                min_region_size: int = MIN_REGION_SIZE):
-    """Основная функция обработки — объединяет все шаги"""
-    # Загрузка
+    """Основная функция обработки"""
     input_img = Image.open(io.BytesIO(photo_bytes))
     
-    # Обработка
     simplified = preprocess_image(input_img)
     quantized, centers = apply_kmeans(simplified, n_colors)
-    canvas = create_coloring_page(quantized, centers, min_region_size)
-    palette = create_palette_image(centers, canvas.shape[1])
     
-    # Сборка: раскраска сверху, палитра снизу
-    final_img_bgr = np.vstack([canvas, palette])
-    final_img_rgb = cv2.cvtColor(final_img_bgr, cv2.COLOR_BGR2RGB)
+    # Получаем numpy массив и конвертим в PIL
+    canvas_np = create_coloring_page(quantized, centers, min_region_size)
+    coloring_img = Image.fromarray(canvas_np)
     
-    # Сохраняем раскраску и палитру отдельно
-    coloring_img = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-    palette_img = Image.fromarray(cv2.cvtColor(palette, cv2.COLOR_BGR2RGB))
+    palette_img = create_palette_image(centers, coloring_img.width)
     
+    # Сохраняем в память
     coloring_buffer = io.BytesIO()
     coloring_img.save(coloring_buffer, format='PNG')
     coloring_buffer.seek(0)
@@ -156,41 +210,40 @@ def process_image_for_coloring(photo_bytes: bytes, n_colors: int = DEFAULT_N_COL
     return coloring_buffer, palette_buffer
 
 
-# --- Функции бота ---
+# --- Функции бота (без изменений) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        '🎨 <b>Бот "Раскраска по номерам"</b>\n\n'
-        'Отправьте фото — получите раскраску!\n\n'
+        '🎨 <b>Бот "Раскраска по номерам" (Factory Edition)</b>\n\n'
+        'Отправьте фото — получите идеальную раскраску!\n\n'
         '<b>Команды:</b>\n'
         '• <code>/colors 24</code> — количество цветов (3-48)\n'
         '• <code>/detail 250</code> — мин. размер области (50-500)\n'
         '• <code>/help</code> — справка\n\n'
-        '💡 Больше цветов = больше деталей\n'
-        '💡 Меньше /detail = больше мелких зон',
+        '💡 Линии теперь плавные, а цифры не вылезают за края!',
         parse_mode='HTML'
     )
 
 
 async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ <code>/colors 24</code>', parse_mode='HTML')
+        await update.message.reply_text('❌ Укажите число, например: <code>/colors 24</code>', parse_mode='HTML')
         return
     n_colors = int(context.args[0])
     if not 3 <= n_colors <= 48:
-        await update.message.reply_text('❌ 3-48 цветов', parse_mode='HTML')
+        await update.message.reply_text('❌ Допустимо от 3 до 48 цветов', parse_mode='HTML')
         return
     context.user_data['n_colors'] = n_colors
-    await update.message.reply_text(f'✅ {n_colors} цветов')
+    await update.message.reply_text(f'✅ Установлено {n_colors} цветов')
 
 
 async def set_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ <code>/detail 250</code>', parse_mode='HTML')
+        await update.message.reply_text('❌ Укажите число, например: <code>/detail 250</code>', parse_mode='HTML')
         return
     min_size = int(context.args[0])
     if not 50 <= min_size <= 500:
-        await update.message.reply_text('❌ 50-500', parse_mode='HTML')
+        await update.message.reply_text('❌ Допустимо от 50 до 500', parse_mode='HTML')
         return
     context.user_data['min_size'] = min_size
     await update.message.reply_text(f'✅ Мин. область: {min_size}px')
@@ -200,7 +253,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message = update.message
     photo = message.photo[-1]
     
-    status_msg = await message.reply_text('🎨 Обрабатываю...')
+    status_msg = await message.reply_text('🎨 Создаем фабричную раскраску...')
     
     try:
         file = await photo.get_file()
@@ -209,36 +262,38 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         n_colors = context.user_data.get('n_colors', DEFAULT_N_COLORS)
         min_size = context.user_data.get('min_size', MIN_REGION_SIZE)
         
+        # Выносим тяжелую работу в отдельный поток, чтобы бот не зависал
         coloring_buffer, palette_buffer = await asyncio.to_thread(
             process_image_for_coloring, bytes(photo_bytes), n_colors, min_size
         )
         
         await message.reply_photo(
             coloring_buffer,
-            caption=f'🖼️ Раскраска!\n🎨 Цветов: {n_colors}\n📏 Мин. область: {min_size}px'
+            caption=f'🖼️ Раскраска готова!\n🎨 Цветов: {n_colors}\n📏 Отсечено мелких зон: < {min_size}px'
         )
-        await message.reply_photo(palette_buffer, caption='🎨 Палитра')
+        await message.reply_photo(palette_buffer, caption='🎨 Палитра для распечатки')
         
     except Exception as e:
         logger.error(f'Ошибка: {e}', exc_info=True)
-        await message.reply_text('❌ Ошибка обработки. Попробуйте другое фото.')
+        await message.reply_text('❌ Ошибка обработки. Попробуйте фото попроще или измените /detail.')
     finally:
         await status_msg.delete()
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        '📖 <b>Справка</b>\n\n'
+        '📖 <b>Справка по "Factory Edition"</b>\n\n'
+        '<b>Что изменилось:</b>\n'
+        '• Линии стали гладкими (без зубцов)\n'
+        '• Появились внутренние детали (глаза, пуговицы)\n'
+        '• Цифры идеально вписаны в зоны\n'
+        '• Убраны пиксельные артефакты\n\n'
         '<b>Команды:</b>\n'
-        '• /start — начать\n'
-        '• /colors N — цветов (3-48, по умолч. 24)\n'
-        '• /detail N — мин. область в px (50-500, по умолч. 250)\n'
-        '• /help — справка\n\n'
+        '• /colors N — цветов (3-48)\n'
+        '• /detail N — мин. область (50-500)\n\n'
         '<b>Советы:</b>\n'
-        '• Больше цветов = больше деталей\n'
-        '• Меньше мин. область = больше мелких зон\n'
-        '• Для портретов: /colors 30 /detail 150\n'
-        '• Для пейзажей: /colors 20 /detail 300',
+        '• Для детей: /colors 12 /detail 400\n'
+        '• Для взрослых: /colors 32 /detail 150',
         parse_mode='HTML'
     )
 
@@ -250,11 +305,4 @@ def main() -> None:
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('colors', set_colors))
     application.add_handler(CommandHandler('detail', set_detail))
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
-    
-    logger.info('🎨 Бот запущен!')
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == '__main__':
-    main()
+    application.add_handler(MessageHandler(filters
