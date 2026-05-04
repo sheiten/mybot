@@ -57,63 +57,48 @@ def apply_kmeans(img_bgr: np.ndarray, num_colors: int):
     return quantized, centers
 
 
-def create_coloring_page(quantized: np.ndarray, centers: np.ndarray, min_region_size: int):
-    """Создание контуров, удаление мусора и нумерация"""
+def create_coloring_page(quantized, centers, min_region_size=500): # Увеличил лимит
     h, w = quantized.shape[:2]
-    cleaned = quantized.copy()
     
-    # Правильная инициализация маски для floodFill
-    mask_v = np.zeros((h + 2, w + 2), np.uint8)
+    # 1. СИЛЬНОЕ сглаживание перед поиском контуров
+    # MedianBlur убивает "пиксельные" углы
+    cleaned = cv2.medianBlur(quantized, 7) 
     
-    # Region Merging: удаляем микро-островки
-    for y in range(h):
-        for x in range(w):
-            if mask_v[y + 1, x + 1] == 0:
-                color = cleaned[y, x].tolist()
-                
-                # retval — количество заполненных пикселей (площадь области)
-                retval, _, _, _ = cv2.floodFill(
-                    cleaned, mask_v, (x, y), color,
-                    (0, 0, 0), (0, 0, 0), flags=4 | (255 << 8)
-                )
-                
-                if retval < min_region_size:
-                    # Ищем соседний цвет для замены маленькой области
-                    nx, ny = max(0, x - 1), max(0, y - 1)
-                    neighbor_color = cleaned[ny, nx].tolist()
-                    cv2.floodFill(cleaned, None, (x, y), neighbor_color)
-    
-    # Отрисовка контуров
-    kernel = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(cleaned, kernel)
-    edges = cv2.absdiff(dilated, cleaned)
-    edges_gray = cv2.cvtColor(edges, cv2.COLOR_BGR2GRAY)
-    _, binary_edges = cv2.threshold(edges_gray, 1, 255, cv2.THRESH_BINARY)
-    
-    # Белый холст
+    # 2. Морфологическая очистка (убирает микро-выступы на границах)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+
     canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
-    # Светло-серые границы там, где есть перепад
-    canvas[binary_edges > 0] = (200, 200, 200)
     
-    # Простановка цифр
+    # 3. Обрабатываем каждый цвет отдельно для сглаживания контуров
     for i, color in enumerate(centers):
-        color_mask = cv2.inRange(cleaned, color, color)
-        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask = cv2.inRange(cleaned, color, color)
+        
+        # Находим контуры
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         for cnt in contours:
+            # Игнорируем мелочь
             if cv2.contourArea(cnt) < min_region_size:
                 continue
-            M = cv2.moments(cnt)
+            
+            # СЕКРЕТ ФАБРИЧНОГО ВИДА: Аппроксимация контура
+            # Это делает линии плавными и прямыми, убирая "дрожание" руки алгоритма
+            epsilon = 0.001 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, epsilon, True)
+            
+            # Рисуем сглаженный контур серым цветом
+            cv2.drawContours(canvas, [approx], -1, (200, 200, 200), 1)
+            
+            # Ставим номер
+            M = cv2.moments(approx)
             if M["m00"] != 0:
                 cX, cY = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-                if cv2.pointPolygonTest(cnt, (cX, cY), False) >= 0:
-                    # Белый фон под цифрой для читаемости
-                    cv2.putText(canvas, str(i + 1), (cX - 8, cY + 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 2)  # Белая обводка
-                    cv2.putText(canvas, str(i + 1), (cX - 8, cY + 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 80), 1)   # Серый текст
-    
+                if cv2.pointPolygonTest(approx, (cX, cY), False) >= 0:
+                    cv2.putText(canvas, str(i + 1), (cX - 8, cY + 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+                                
     return canvas
-
 
 def create_palette_image(centers: np.ndarray, width: int) -> np.ndarray:
     """Создание изображения палитры"""
