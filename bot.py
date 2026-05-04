@@ -22,12 +22,8 @@ DEFAULT_MIN_SIZE = 3000  # Безопасный дефолт
 MAX_IMAGE_SIZE = 800
 FONT_SIZE = 16
 
-logging.basicConfig(
-    format='% ( asctime ) s - % ( name ) s - % ( levelname ) s - % ( message ) s',
-    level=logging.INFO
-)
-logger = logging.getLogger ( __name__)
-
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # === ОБРАБОТКА ИЗОБРАЖЕНИЙ ===
 
