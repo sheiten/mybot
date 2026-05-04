@@ -53,45 +53,61 @@ def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 # === ОБРАБОТКА ИЗОБРАЖЕНИЙ ===
 
 def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> np.ndarray:
+def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> np.ndarray:
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
     width, height = image.size
-    # Ресайз для ускорения обработки
     if max(width, height) > target_size:
         ratio = target_size / max(width, height)
         new_size = (int(width * ratio), int(height * ratio))
+        # Используем BOX или HAMMING для более мягкого уменьшения без лишней резкости
         image = image.resize(new_size, Image.Resampling.LANCZOS)
     
     img_array = np.array(image)
-    # Уменьшаем шум перед кластеризацией
-    img_array = cv2.GaussianBlur(img_array, (5, 5), 0)
-    img_array = cv2.bilateralFilter(img_array, d=9, sigmaColor=100, sigmaSpace=100)
+    
+    # 1. Сильный медианный фильтр уберет мелкие "островки" пикселей
+    img_array = cv2.medianBlur(img_array, 5)
+    
+    # 2. Билатеральный фильтр сделает цветовые пятна более однородными
+    img_array = cv2.bilateralFilter(img_array, d=9, sigmaColor=75, sigmaSpace=75)
+    
     return img_array
-
 
 def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, List[Tuple[int, int, int]], np.ndarray]:
     h, w, c = img_array.shape
-    pixels = img_array.reshape(-1, c)
     
-    # KMeans для нахождения основных цветов
-    kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10, max_iter=300)
+    # ПЕРЕХОДИМ В Lab для лучшей кластеризации
+    lab_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
+    pixels = lab_img.reshape(-1, c).astype(np.float32)
+    
+    kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10)
     labels = kmeans.fit_predict(pixels)
-    centers = kmeans.cluster_centers_.astype(np.uint8)
     
-    # Сортировка цветов по яркости (от темного к светлому)
-    brightness = [np.mean(color) for color in centers]
+    # Возвращаем центры в RGB
+    centers_lab = kmeans.cluster_centers_.astype(np.uint8).reshape(1, -1, 3)
+    centers_rgb = cv2.cvtColor(centers_lab, cv2.COLOR_LAB2RGB).reshape(-1, 3)
+    
+    # Сортировка по яркости
+    brightness = [0.299*r + 0.587*g + 0.114*b for r, g, b in centers_rgb]
     sorted_indices = np.argsort(brightness)
-    centers_sorted = centers[sorted_indices]
+    centers_sorted = centers_rgb[sorted_indices]
     
-    # Перемаппинг меток пикселей согласно новой сортировке
-    label_map = {old: new for new, old in enumerate(sorted_indices)}
-    labels_mapped = np.array([label_map[l] for l in labels]).reshape(h, w).astype(np.uint8)
+    # Перемаппинг
+    label_map = np.zeros(n_colors, dtype=np.uint8)
+    for new, old in enumerate(sorted_indices):
+        label_map[old] = new
+    labels_mapped = label_map[labels].reshape(h, w)
+
+    # УДАЛЕНИЕ ШУМА (вместо medianBlur на индексах)
+    # Морфологическое закрытие уберет мелкие дырки внутри сегментов
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    labels_mapped = cv2.morphologyEx(labels_mapped, cv2.MORPH_OPEN, kernel)
     
-    # Сглаживание границ областей (убирает "шум" внутри пятен)
-    labels_mapped = cv2.medianBlur(labels_mapped, 5)
+    # Создаем финальное изображение для визуализации
+    clustered_img = centers_sorted[labels_mapped]
     
-    return img_array, [tuple(c) for c in centers_sorted], labels_mapped
+    return clustered_img, [tuple(c) for c in centers_sorted], labels_mapped
 
 
 def find_largest_inscribed_circle(mask: np.ndarray):
