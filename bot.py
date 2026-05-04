@@ -212,23 +212,168 @@ def create_coloring_page(width: int, height: int, labels: np.ndarray, palette: L
     
     for idx, color in enumerate(palette, start=1):
         y_pos = 60 + (idx - 1) * 45
+def create_coloring_page(width: int, height: int, labels: np.ndarray, palette: List[Tuple[int, int, int]], min_region_size: int) -> Tuple[Image.Image, Image.Image]:
+    h, w = labels.shape
+    
+    # === НОВЫЙ ПОДХОД: находим ВСЕ границы регионов одной операцией ===
+    
+    # Создаём маску границ через градиент (нахождение перепадов между регионами)
+    # Сначала убираем шум — сглаживаем слегка метки
+    labels_smooth = cv2.medianBlur(labels.astype(np.uint8), 3)
+    
+    # Находим горизонтальные и вертикальные границы
+    edges_h = np.abs(np.diff(labels_smooth, axis=1)) > 0
+    edges_v = np.abs(np.diff(labels_smooth, axis=0)) > 0
+    
+    # Создаём изображение границ
+    border_mask = np.zeros((h, w), dtype=bool)
+    border_mask[:, 1:] |= edges_h
+    border_mask[1:, :] |= edges_v
+    border_mask[:, :-1] |= edges_h
+    border_mask[:-1, :] |= edges_v
+    
+    # Утоньшаем границы до 1 пикселя через скелетизацию
+    border_mask_uint8 = border_mask.astype(np.uint8) * 255
+    # Скелетизация (превращаем толстые границы в однопиксельные)
+    skeleton = cv2.ximgproc.thinning(border_mask_uint8, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+    # Если cv2.ximgproc недоступен, используем упрощённый подход:
+    if skeleton is None:
+        skeleton = border_mask_uint8
+        # Утоньшаем через эрозию
+        kernel = np.ones((2, 2), np.uint8)
+        skeleton = cv2.erode(skeleton, kernel, iterations=1)
+    
+    # Создаём чистое изображение раскраски
+    coloring = Image.new('RGB', (width, height), 'white')
+    coloring_array = np.array(coloring)
+    
+    # Рисуем границы тонкой серой линией (как в профессиональных раскрасках)
+    coloring_array[skeleton > 0] = [180, 180, 180]  # Светло-серый, тонкий
+    coloring = Image.fromarray(coloring_array)
+    draw = ImageDraw.Draw(coloring)
+    
+    # === РАССТАНОВКА НОМЕРОВ ===
+    try:
+        font = ImageFont.truetype("arial.ttf", 14)  # Увеличил шрифт
+    except Exception:
+        font = ImageFont.load_default()
+    
+    drawn_positions = []
+    
+    # Собираем регионы по цветам
+    regions_by_color = {}
+    for label_idx in np.unique(labels):
+        mask = (labels == label_idx).astype(np.uint8)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Квадрат с цветом
-        palette_draw.rectangle([(15, y_pos), (50, y_pos + 35)], fill=color, outline='black', width=2)
+        regions_by_color[label_idx] = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area >= min_region_size:
+                regions_by_color[label_idx].append({
+                    'contour': cnt,
+                    'area': area
+                })
+    
+    # Для каждого цвета ставим номер в самой большой области
+    for color_num, label_idx in enumerate(range(len(palette)), start=1):
+        if label_idx not in regions_by_color or not regions_by_color[label_idx]:
+            continue
         
-        # Номер цвета
-        palette_draw.text((65, y_pos + 10), f"{idx}", fill='black', font=font)
+        # Сортируем регионы по площади
+        regions = sorted(regions_by_color[label_idx], key=lambda x: x['area'], reverse=True)
         
-        # HEX-код цвета
+        for region in regions:
+            # Находим центр масс контура
+            moments = cv2.moments(region['contour'])
+            if moments['m00'] == 0:
+                continue
+            
+            cx = int(moments['m10'] / moments['m00'])
+            cy = int(moments['m01'] / moments['m00'])
+            
+            # Проверяем, что центр внутри контура
+            if cv2.pointPolygonTest(region['contour'], (cx, cy), False) < 0:
+                # Центр масс снаружи — используем любую точку внутри
+                mask_temp = np.zeros(labels.shape, dtype=np.uint8)
+                cv2.drawContours(mask_temp, [region['contour']], -1, 255, -1)
+                ys, xs = np.where(mask_temp > 0)
+                if len(ys) == 0:
+                    continue
+                cx, cy = xs[len(xs)//2], ys[len(ys)//2]
+            
+            # Проверяем минимальное расстояние до других номеров
+            too_close = False
+            for dx, dy in drawn_positions:
+                dist = math.sqrt((cx - dx)**2 + (cy - dy)**2)
+                if dist < 28:  # Увеличил расстояние
+                    too_close = True
+                    break
+            
+            if not too_close:
+                # Проверяем, что область достаточно большая
+                if region['area'] < 200:  # Минимальная площадь для номера
+                    continue
+                
+                num_str = str(color_num)
+                bbox = draw.textbbox((0, 0), num_str, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                
+                # Рисуем белый фон под номером для читаемости
+                padding = 3
+                draw.rectangle(
+                    [cx - text_w//2 - padding, cy - text_h//2 - padding,
+                     cx + text_w//2 + padding, cy + text_h//2 + padding],
+                    fill='white',
+                    outline=None
+                )
+                
+                # Рисуем сам номер
+                draw.text((cx - text_w//2, cy - text_h//2), num_str, fill=(80, 80, 80), font=font)
+                drawn_positions.append((cx, cy))
+                break
+    
+    # === СОЗДАНИЕ ПАЛИТРЫ (улучшенный дизайн) ===
+    n_colors = len(palette)
+    square_size = 30
+    palette_height = 80 + n_colors * 40
+    palette_img = Image.new('RGB', (300, palette_height), 'white')
+    palette_draw = ImageDraw.Draw(palette_img)
+    
+    title_font = font
+    try:
+        title_font = ImageFont.truetype("arial.ttf", 16)
+    except:
+        title_font = font
+    
+    palette_draw.text((10, 15), "🎨 ПАЛИТРА ЦВЕТОВ", fill='black', font=title_font)
+    palette_draw.text((10, 38), f"Всего цветов: {n_colors}", fill='gray', font=font)
+    
+    for idx, color in enumerate(palette, start=1):
+        y_pos = 65 + (idx - 1) * 40
+        
+        # Квадрат с цветом и скруглением не делаем, просто аккуратный прямоугольник
+        palette_draw.rectangle(
+            [(15, y_pos), (15 + square_size, y_pos + square_size)],
+            fill=color,
+            outline=(200, 200, 200),
+            width=1
+        )
+        
+        # Номер
+        palette_draw.text((55, y_pos + 5), f"{idx}.", fill='black', font=font)
+        
+        # HEX
         hex_color = f'#{color[0]:02x}{color[1]:02x}{color[2]:02x}'
-        palette_draw.text((100, y_pos + 10), hex_color, fill='gray', font=font)
+        palette_draw.text((100, y_pos + 5), hex_color, fill='gray', font=font)
         
-        # Линия-разделитель
-        if idx < n_colors:
-            palette_draw.line([(15, y_pos + 40), (280, y_pos + 40)], fill='#e0e0e0', width=1)
+        # Пример цвета в кружке
+        r = 8
+        palette_draw.ellipse([255-r, y_pos+square_size//2-r, 255+r, y_pos+square_size//2+r], 
+                            fill=color, outline=(180,180,180), width=1)
     
     return coloring, palette_img
-
 
 def process_image_for_coloring(photo_bytes: bytes, n_colors: int = DEFAULT_N_COLORS, min_region_size: int = MIN_REGION_SIZE) -> Tuple[io.BytesIO, io.BytesIO]:
     image = Image.open(io.BytesIO(photo_bytes))
