@@ -2,4 +2,4 @@ python-telegram-bot>=20.0
 numpy==1.26.4
 pillow>=9.0.0
 scikit-learn>=1.2.0
-opencv-python-headless>=4.7.0
+opencv-contrib-python-headless>=4.7.0
