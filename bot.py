@@ -305,4 +305,11 @@ def main() -> None:
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('colors', set_colors))
     application.add_handler(CommandHandler('detail', set_detail))
-    application.add_handler(MessageHandler(filters
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
+    
+    logger.info('🎨 Factory Bot запущен!')
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
