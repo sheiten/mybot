@@ -16,10 +16,10 @@ TOKEN = os.environ.get('BOT_TOKEN', '')
 if not TOKEN:
     raise ValueError('BOT_TOKEN environment variable is not set!')
 
-DEFAULT_N_COLORS = 12
-MIN_REGION_SIZE = 200
-MAX_IMAGE_SIZE = 800
-FONT_SIZE = 14
+DEFAULT_N_COLORS = 18
+MIN_REGION_SIZE = 100
+MAX_IMAGE_SIZE = 1500
+FONT_SIZE = 12
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ def create_coloring_page(width: int, height: int, labels: np.ndarray, palette: L
             
             # Рисуем контур
             if len(points) > 2:
-                draw.line(points + [points[0]], fill="black", width=2)
+                draw.line(points + [points[0]], fill="black", width=0.25)
             
             # Находим центр для цифры
             temp_mask = np.zeros(labels.shape, dtype=np.uint8)
