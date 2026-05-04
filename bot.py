@@ -63,11 +63,12 @@ def cluster_colors ( img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, 
     return img_array, [tuple ( c) for c in centers_sorted], labels_mapped
 
 
-def find_largest_inscribed_circle ( mask: np.ndarray) -> Tuple[Tuple[int, int], float]:
-    dist = cv2.distanceTransform ( mask, cv2.DIST_L2, 5)
-    _, _, maxVal, maxLoc = cv2.minMaxLoc ( dist)
-    return maxVal, maxLoc
-
+def find_largest_inscribed_circle(mask: np.ndarray) -> Tuple[Tuple[int, int], float]:
+    """Находит центр и радиус наибольшей вписанной окружности"""
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    # ПРАВИЛЬНАЯ РАСПАКОВКА: (minVal, maxVal, minLoc, maxLoc)
+    _, maxVal, _, maxLoc = cv2.minMaxLoc(dist)
+    return maxLoc, float(maxVal)
 
 def create_coloring_page ( width: int, height: int, labels: np.ndarray, palette: List[Tuple[int, int, int]], min_size: int = DEFAULT_MIN_SIZE) -> Tuple[Image.Image, Image.Image]:
     coloring = Image.new ( 'RGB', (width, height ) , 'white')
