@@ -62,17 +62,23 @@ def create_coloring_page(quantized: np.ndarray, centers: np.ndarray, min_region_
     h, w = quantized.shape[:2]
     cleaned = quantized.copy()
     
+    # Правильная инициализация маски для floodFill
+    mask_v = np.zeros((h + 2, w + 2), np.uint8)
+    
     # Region Merging: удаляем микро-островки
-    mask_visited = np.zeros((h + 2, w + 2), np.uint8)
     for y in range(h):
         for x in range(w):
-            if mask_visited[y + 1, x + 1] == 0:
+            if mask_v[y + 1, x + 1] == 0:
                 color = cleaned[y, x].tolist()
-                _, _, area, _ = cv2.floodFill(
-                    cleaned, mask_visited, (x, y), color,
+                
+                # retval — количество заполненных пикселей (площадь области)
+                retval, _, _, _ = cv2.floodFill(
+                    cleaned, mask_v, (x, y), color,
                     (0, 0, 0), (0, 0, 0), flags=4 | (255 << 8)
                 )
-                if area < min_region_size:
+                
+                if retval < min_region_size:
+                    # Ищем соседний цвет для замены маленькой области
                     nx, ny = max(0, x - 1), max(0, y - 1)
                     neighbor_color = cleaned[ny, nx].tolist()
                     cv2.floodFill(cleaned, None, (x, y), neighbor_color)
@@ -100,8 +106,11 @@ def create_coloring_page(quantized: np.ndarray, centers: np.ndarray, min_region_
             if M["m00"] != 0:
                 cX, cY = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
                 if cv2.pointPolygonTest(cnt, (cX, cY), False) >= 0:
-                    cv2.putText(canvas, str(i + 1), (cX - 7, cY + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+                    # Белый фон под цифрой для читаемости
+                    cv2.putText(canvas, str(i + 1), (cX - 8, cY + 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 2)  # Белая обводка
+                    cv2.putText(canvas, str(i + 1), (cX - 8, cY + 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 80), 1)   # Серый текст
     
     return canvas
 
