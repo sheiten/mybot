@@ -195,7 +195,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text('❌ <code>/colors 12</code>', parse_mode='HTML')
-        return    n_colors = int(context.args[0])
+        return
+        n_colors = int(context.args[0])
     if not 3 <= n_colors <= 30:
         await update.message.reply_text('❌ 3-30 цветов', parse_mode='HTML')
         return
