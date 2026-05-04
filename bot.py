@@ -18,7 +18,7 @@ if not TOKEN:
     raise ValueError ( 'BOT_TOKEN environment variable is not set!')
 
 DEFAULT_N_COLORS = 12
-DEFAULT_MIN_SIZE = 3000  # Безопасный дефолт
+DEFAULT_MIN_SIZE = 500  # Безопасный дефолт
 MAX_IMAGE_SIZE = 800
 FONT_SIZE = 16
 
@@ -55,20 +55,16 @@ def cluster_colors ( img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, 
     label_map = {old: new for new, old in enumerate ( sorted_indices ) }
     labels_mapped = np.array ( [label_map[l] for l in labels] ) .reshape ( h, w ) .astype ( np.uint8)
     
-    kernel = np.ones (  ( 3,3 ) ,np.uint8)
-    labels_mapped = cv2.morphologyEx ( labels_mapped, cv2.MORPH_OPEN, kernel, iterations=1)
-    labels_mapped = cv2.morphologyEx ( labels_mapped, cv2.MORPH_CLOSE, kernel, iterations=1)
+
     labels_mapped = cv2.medianBlur ( labels_mapped, 5)
     
     return img_array, [tuple ( c) for c in centers_sorted], labels_mapped
 
 
-def find_largest_inscribed_circle(mask: np.ndarray) -> Tuple[Tuple[int, int], float]:
-    """Находит центр и радиус наибольшей вписанной окружности"""
+def find_largest_inscribed_circle(mask: np.ndarray):
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    # ПРАВИЛЬНАЯ РАСПАКОВКА: (minVal, maxVal, minLoc, maxLoc)
-    _, maxVal, _, maxLoc = cv2.minMaxLoc(dist)
-    return maxLoc, float(maxVal)
+    minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(dist)
+    return maxLoc, maxVal
 
 def create_coloring_page ( width: int, height: int, labels: np.ndarray, palette: List[Tuple[int, int, int]], min_size: int = DEFAULT_MIN_SIZE) -> Tuple[Image.Image, Image.Image]:
     coloring = Image.new ( 'RGB', (width, height ) , 'white')
@@ -93,7 +89,7 @@ def create_coloring_page ( width: int, height: int, labels: np.ndarray, palette:
             if area < min_size:
                 continue
             
-            epsilon = 0.015 * cv2.arcLength ( cnt, True)
+            epsilon = 0.005 * cv2.arcLength ( cnt, True)
             approx = cv2.approxPolyDP ( cnt, epsilon, True)
             points = [ ( int ( p[0][0] ) , int ( p[0][1] ) ) for p in approx]
             
@@ -103,7 +99,7 @@ def create_coloring_page ( width: int, height: int, labels: np.ndarray, palette:
             cv2.drawContours ( temp_mask, [approx], -1, 255, -1)
             center, radius = find_largest_inscribed_circle ( temp_mask)
             
-            if radius > FONT_SIZE:
+            if radius > FONT_SIZE * 1.2:
                 regions_info.append ( {
                     'num': int ( label_idx) + 1,
                     'center': center,
