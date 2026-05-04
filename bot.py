@@ -66,7 +66,7 @@ def cluster_colors ( img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, 
 def find_largest_inscribed_circle ( mask: np.ndarray) -> Tuple[Tuple[int, int], float]:
     dist = cv2.distanceTransform ( mask, cv2.DIST_L2, 5)
     _, _, maxVal, maxLoc = cv2.minMaxLoc ( dist)
-    return maxLoc, maxVal
+    return maxVal, maxLoc
 
 
 def create_coloring_page ( width: int, height: int, labels: np.ndarray, palette: List[Tuple[int, int, int]], min_size: int = DEFAULT_MIN_SIZE) -> Tuple[Image.Image, Image.Image]:
