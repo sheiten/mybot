@@ -17,7 +17,7 @@ if not TOKEN:
     raise ValueError('BOT_TOKEN environment variable is not set!')
 
 DEFAULT_N_COLORS = 12
-MIN_REGION_SIZE = 100
+MIN_REGION_SIZE = 200
 MAX_IMAGE_SIZE = 800
 FONT_SIZE = 14
 
@@ -37,8 +37,8 @@ def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> n
     img_array = np.array(image)
     
     # Сглаживание перед кластеризацией
-    img_array = cv2.GaussianBlur(img_array, (5, 5), 0)
-    img_array = cv2.bilateralFilter(img_array, d=9, sigmaColor=75, sigmaSpace=75)
+    img_array = cv2.GaussianBlur(img_array, (9, 9), 0)
+    img_array = cv2.bilateralFilter(img_array, d=9, sigmaColor=100, sigmaSpace=100)
     
     return img_array
 
@@ -62,7 +62,7 @@ def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, Li
     
     # Медианный фильтр ПОСЛЕ кластеризации (убирает шум)
     labels_mapped = cv2.medianBlur(labels_mapped, 5)
-    
+    labels_mapped = cv2.medianBlur(labels_mapped, 5)  # Еще раз!
     return img_array, [tuple(c) for c in centers_sorted], labels_mapped
 
 
@@ -98,7 +98,7 @@ def create_coloring_page(width: int, height: int, labels: np.ndarray, palette: L
                 continue
             
             # УПРОЩЕНИЕ КОНТУРОВ: epsilon = 0.001-0.005 для плавных линий
-            epsilon = 0.003 * cv2.arcLength(cnt, True)
+            epsilon = 0.01 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             
             points = [(int(p[0][0]), int(p[0][1])) for p in approx]
