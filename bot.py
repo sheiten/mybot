@@ -97,7 +97,8 @@ def create_coloring_page(width: int, height: int, labels: np.ndarray, palette: L
             if area < min_region_size:
                 continue
             
-            # УПРОЩЕНИЕ КОНТУРОВ: epsilon = 0.001-0.005 для плавных линий            epsilon = 0.003 * cv2.arcLength(cnt, True)
+            # УПРОЩЕНИЕ КОНТУРОВ: epsilon = 0.001-0.005 для плавных линий
+            epsilon = 0.003 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             
             points = [(int(p[0][0]), int(p[0][1])) for p in approx]
