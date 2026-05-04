@@ -9,7 +9,6 @@ import numpy as np
 from PIL import Image
 import io
 from sklearn.cluster import KMeans
-from aiogram import Bot, Dispatcher, types
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from sklearn.cluster import KMeans
