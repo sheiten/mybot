@@ -42,7 +42,7 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
     # Убираем шум
     img_bgr = cv2.bilateralFilter(img_bgr, 9, 75, 75)
     # Группируем пиксели в цветовые пятна
-    shifted = cv2.pyrMeanShiftFiltering(img_bgr, 20, 45)
+    shifted = cv2.pyrMeanShiftFiltering(img_bgr, 10, 30)
     # Сглаживаем края
     return cv2.medianBlur(shifted, 5)
 
@@ -57,48 +57,53 @@ def apply_kmeans(img_bgr: np.ndarray, num_colors: int):
     return quantized, centers
 
 
-def create_coloring_page(quantized, centers, min_region_size=500): # Увеличил лимит
+def create_coloring_page(quantized, centers):
     h, w = quantized.shape[:2]
     
-    # 1. СИЛЬНОЕ сглаживание перед поиском контуров
-    # MedianBlur убивает "пиксельные" углы
-    cleaned = cv2.medianBlur(quantized, 7) 
+    # 1. Усиленное сглаживание для удаления "пиксельного шума" без потери форм
+    # Это позволит нам снизить min_region_size без появления грязи
+    cleaned = cv2.medianBlur(quantized, 5)
     
-    # 2. Морфологическая очистка (убирает микро-выступы на границах)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-
+    # 2. Уменьшаем порог до 150-200, чтобы вернуть детали
+    min_area = 180 
+    
     canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
     
-    # 3. Обрабатываем каждый цвет отдельно для сглаживания контуров
     for i, color in enumerate(centers):
         mask = cv2.inRange(cleaned, color, color)
-        
-        # Находим контуры
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)
         
         for cnt in contours:
-            # Игнорируем мелочь
-            if cv2.contourArea(cnt) < min_region_size:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
                 continue
             
-            # СЕКРЕТ ФАБРИЧНОГО ВИДА: Аппроксимация контура
-            # Это делает линии плавными и прямыми, убирая "дрожание" руки алгоритма
-            epsilon = 0.001 * cv2.arcLength(cnt, True)
+            # Сглаживаем контур
+            epsilon = 0.0015 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             
-            # Рисуем сглаженный контур серым цветом
-            cv2.drawContours(canvas, [approx], -1, (200, 200, 200), 1)
+            # Рисуем контур (чуть темнее серый для четкости)
+            cv2.drawContours(canvas, [approx], -1, (160, 160, 160), 1)
             
-            # Ставим номер
+            # 3. Адаптивный шрифт
             M = cv2.moments(approx)
             if M["m00"] != 0:
                 cX, cY = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                
+                # Масштабируем шрифт: для маленьких зон 0.2, для больших до 0.5
+                font_scale = 0.2 + (min(area, 5000) / 5000) * 0.3
+                thickness = 1
+                
+                # Проверяем, влезет ли текст в центр области
                 if cv2.pointPolygonTest(approx, (cX, cY), False) >= 0:
-                    cv2.putText(canvas, str(i + 1), (cX - 8, cY + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
-                                
+                    label = str(i + 1)
+                    # Вычисляем размер текста для центровки
+                    (t_w, t_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                    cv2.putText(canvas, label, (cX - t_w//2, cY + t_h//2),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (80, 80, 80), thickness)
+
     return canvas
+
 
 def create_palette_image(centers: np.ndarray, width: int) -> np.ndarray:
     """Создание изображения палитры"""
