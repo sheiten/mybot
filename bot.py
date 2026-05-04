@@ -105,7 +105,7 @@ def create_coloring_page(width: int, height: int, labels: np.ndarray, palette: L
             
             # Рисуем контур
             if len(points) > 2:
-                draw.line(points + [points[0]], fill="black", width=0.25)
+                draw.line(points + [points[0]], fill="black", width=1)
             
             # Находим центр для цифры
             temp_mask = np.zeros(labels.shape, dtype=np.uint8)
