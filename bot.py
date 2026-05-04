@@ -78,13 +78,14 @@ def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, Li
         mask = (labels_mapped == label).astype(np.uint8) * 255
         
         # Находим все компоненты связности для этого цвета
-        num_labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        # connectedComponentsWithStats возвращает 4 значения: num_labels, labels, stats, centroids
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
         
         for i in range(1, num_labels):
             if stats[i, cv2.CC_STAT_AREA] < 30:  # Маленькие острова
                 # Заменяем на цвет большинства соседей
-                y, x = stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT] // 2, \
-                       stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH] // 2
+                y = stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT] // 2
+                x = stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH] // 2
                 
                 # Получаем соседние метки
                 neighbors = []
@@ -100,7 +101,6 @@ def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, Li
                     labels_mapped[labels_mapped == label] = most_common
     
     return img_array, [tuple(c) for c in centers_sorted], labels_mapped
-
 
 def find_largest_inscribed_circle(mask: np.ndarray):
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
