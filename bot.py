@@ -167,11 +167,12 @@ def create_palette_image(centers: np.ndarray, width: int) -> Image.Image:
     for i, color in enumerate(centers):
         x_start = i * swatch_w
         
-        # Рисуем квадратик цвета с скругленными углами (эмуляция)
+        # Рисуем квадратик цвета
         x1, y1 = x_start + margin, 10
         x2, y2 = x_start + swatch_w - margin, 50
         
-        draw.rectangle([x1, y1, x2, y2], fill=color.tolist(), outline=(180, 180, 180), width=1)
+        # ИСПРАВЛЕНО ТУТ: обернули в tuple()
+        draw.rectangle([x1, y1, x2, y2], fill=tuple(color.tolist()), outline=(180, 180, 180), width=1)
         
         # Номер под квадратом
         label = str(i + 1)
