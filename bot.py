@@ -57,52 +57,49 @@ def apply_kmeans(img_bgr: np.ndarray, num_colors: int):
     return quantized, centers
 
 
-def create_coloring_page(quantized, centers):
+def create_coloring_page(quantized, centers, min_region_size=150):
+    # Теперь функция принимает 3 аргумента, ошибка TypeError исчезнет
     h, w = quantized.shape[:2]
     
-    # 1. Усиленное сглаживание для удаления "пиксельного шума" без потери форм
-    # Это позволит нам снизить min_region_size без появления грязи
+    # 1. Сглаживание чуть меньше (5 вместо 7), чтобы оставить детали
     cleaned = cv2.medianBlur(quantized, 5)
-    
-    # 2. Уменьшаем порог до 150-200, чтобы вернуть детали
-    min_area = 180 
     
     canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
     
     for i, color in enumerate(centers):
         mask = cv2.inRange(cleaned, color, color)
+        # Находим контуры (TC89_L1 лучше сохраняет форму деталей)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)
         
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < min_area:
+            # Используем min_region_size, который пришел из вызова
+            if area < min_region_size:
                 continue
             
-            # Сглаживаем контур
-            epsilon = 0.0015 * cv2.arcLength(cnt, True)
+            # 2. Аппроксимация (0.001 — очень точное следование контуру)
+            epsilon = 0.001 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             
-            # Рисуем контур (чуть темнее серый для четкости)
+            # Рисуем контур (чуть темнее серый)
             cv2.drawContours(canvas, [approx], -1, (160, 160, 160), 1)
             
-            # 3. Адаптивный шрифт
+            # 3. Умный шрифт (уменьшаем, чтобы влез в детали)
             M = cv2.moments(approx)
             if M["m00"] != 0:
                 cX, cY = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
                 
-                # Масштабируем шрифт: для маленьких зон 0.2, для больших до 0.5
-                font_scale = 0.2 + (min(area, 5000) / 5000) * 0.3
-                thickness = 1
+                # Шрифт теперь совсем мелкий для маленьких деталей
+                font_scale = 0.25 if area < 1000 else 0.4
                 
-                # Проверяем, влезет ли текст в центр области
                 if cv2.pointPolygonTest(approx, (cX, cY), False) >= 0:
                     label = str(i + 1)
-                    # Вычисляем размер текста для центровки
-                    (t_w, t_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                    (t_w, t_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
                     cv2.putText(canvas, label, (cX - t_w//2, cY + t_h//2),
-                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (80, 80, 80), thickness)
-
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (80, 80, 80), 1)
+                            
     return canvas
+
 
 
 def create_palette_image(centers: np.ndarray, width: int) -> np.ndarray:
