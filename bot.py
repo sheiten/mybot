@@ -16,8 +16,8 @@ TOKEN = os.environ.get('BOT_TOKEN', '')
 if not TOKEN:
     raise ValueError('BOT_TOKEN environment variable is not set!')
 
-DEFAULT_N_COLORS = 18
-MIN_REGION_SIZE = 200  # Увеличил, как в скрипте нейросети
+DEFAULT_N_COLORS = 24  # Увеличил для большей детализации
+MIN_REGION_SIZE = 150
 MAX_IMAGE_SIZE = 1500
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> np.ndarray:
-    """Загрузка и предобработка изображения"""
+    """Улучшенная предобработка с сохранением деталей"""
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
@@ -38,63 +38,104 @@ def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> n
     img_array = np.array(image)
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
     
-    # Сильное упрощение: убираем мелкие детали, сохраняя границы
-    shifted = cv2.pyrMeanShiftFiltering(img_bgr, 20, 45)
+    # 1. Увеличиваем контраст через CLAHE для сохранения деталей
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    img_bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    
+    # 2. Мягкое шумоподавление с сохранением краёв
+    img_bgr = cv2.bilateralFilter(img_bgr, 7, 50, 50)
+    
+    # 3. Умеренное упрощение — уменьшены параметры
+    # sp=10 (было 20) — меньше сглаживания
+    # sr=30 (было 45) — меньше цветового сглаживания
+    shifted = cv2.pyrMeanShiftFiltering(img_bgr, 10, 30)
     
     return shifted
 
 
 def cluster_colors(img_bgr: np.ndarray, n_colors: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Квантование цветов через K-Means"""
+    """Квантование цветов с улучшенной кластеризацией"""
     h, w = img_bgr.shape[:2]
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pixels = img_rgb.reshape((-1, 3))
     
-    kmeans = KMeans(n_clusters=n_colors, n_init=10, random_state=42)
+    # Используем мини-батч K-Means для ускорения на больших изображениях
+    from sklearn.cluster import MiniBatchKMeans
+    
+    kmeans = MiniBatchKMeans(
+        n_clusters=n_colors,
+        random_state=42,
+        batch_size=1000,
+        n_init=3
+    )
     labels = kmeans.fit_predict(pixels)
     centers = kmeans.cluster_centers_.astype("uint8")
     
-    # Сортировка центров по яркости для красивой палитры
+    # Сортировка по яркости
     brightness = np.array([0.299*c[0] + 0.587*c[1] + 0.114*c[2] for c in centers])
     sorted_indices = np.argsort(brightness)
     centers_sorted = centers[sorted_indices]
     
-    # Переназначаем метки согласно сортировке
+    # Переназначаем метки
     label_map = {old: new for new, old in enumerate(sorted_indices)}
     labels_mapped = np.array([label_map[l] for l in labels])
     
-    # Квантованное изображение с отсортированными цветами
+    # Квантованное изображение
     quantized = centers_sorted[labels_mapped].reshape((h, w, 3))
     
     return quantized, centers_sorted, labels_mapped.reshape((h, w))
 
 
 def create_coloring_page(quantized: np.ndarray, centers: np.ndarray, labels_map: np.ndarray, min_region_size: int) -> Tuple[Image.Image, Image.Image]:
-    """Создание раскраски и палитры"""
+    """Создание раскраски с улучшенной детализацией и нумерацией"""
     h, w = quantized.shape[:2]
     
-    # Создание контурного холста через Canny
+    # Создание контуров через Canny с адаптивными порогами
     gray = cv2.cvtColor(quantized, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray, 20, 50)
     
-    # Белый фон с серыми линиями
+    # Адаптивные пороги для Canny на основе статистики изображения
+    median_intensity = np.median(gray)
+    lower = int(max(0, 0.66 * median_intensity))
+    upper = int(min(255, 1.33 * median_intensity))
+    
+    edges = cv2.Canny(gray, lower, upper)
+    
+    # Утолщаем границы для лучшей видимости
+    kernel = np.ones((2, 2), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    
+    # Белый фон
     canvas = np.ones((h, w, 3), dtype="uint8") * 255
-    canvas[edges > 0] = [180, 180, 180]  # Светло-серые границы
+    canvas[edges > 0] = [160, 160, 160]  # Серые границы
     
-    # Конвертируем в PIL для работы с текстом
     coloring = Image.fromarray(canvas)
     draw = ImageDraw.Draw(coloring)
     
     try:
-        font = ImageFont.truetype("arial.ttf", 12)
+        font = ImageFont.truetype("Arial.ttf", 11)
+        small_font = ImageFont.truetype("Arial.ttf", 9)
     except:
         font = ImageFont.load_default()
+        small_font = font
     
-    # Расстановка номеров
+    # Расстановка номеров во ВСЕ регионы
     placed_positions = []
     
     for i, color in enumerate(centers):
-        mask = cv2.inRange(quantized, color, color)
+        # Создаём маску для текущего цвета
+        lower = np.clip(color.astype(int) - 5, 0, 255)
+        upper = np.clip(color.astype(int) + 5, 0, 255)
+        mask = cv2.inRange(quantized, lower, upper)
+        
+        # Морфологическая очистка маски
+        kernel_clean = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_clean)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_clean)
+        
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         for cnt in contours:
@@ -109,31 +150,46 @@ def create_coloring_page(quantized: np.ndarray, centers: np.ndarray, labels_map:
             cX = int(M["m10"] / M["m00"])
             cY = int(M["m01"] / M["m00"])
             
+            # Проверка, что центр внутри контура
+            if cv2.pointPolygonTest(cnt, (cX, cY), False) < 0:
+                continue
+            
             # Проверяем расстояние до других номеров
             too_close = False
             for px, py in placed_positions:
                 dist = math.sqrt((cX - px)**2 + (cY - py)**2)
-                if dist < 25:
+                if dist < 20:
                     too_close = True
                     break
             
-            if not too_close:
-                num_str = str(i + 1)
-                bbox = draw.textbbox((0, 0), num_str, font=font)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                
-                # Белый фон под номером
-                draw.rectangle(
-                    [cX - text_w//2 - 2, cY - text_h//2 - 2,
-                     cX + text_w//2 + 2, cY + text_h//2 + 2],
-                    fill='white',
-                    outline=None
-                )
-                
-                # Рисуем номер
-                draw.text((cX - text_w//2, cY - text_h//2), num_str, fill=(0, 0, 0), font=font)
-                placed_positions.append((cX, cY))
+            if too_close:
+                continue
+            
+            # Выбираем размер шрифта в зависимости от площади
+            current_font = small_font if area < 500 else font
+            
+            num_str = str(i + 1)
+            bbox = draw.textbbox((0, 0), num_str, font=current_font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            
+            # Белый фон под номером
+            padding = 1
+            draw.rectangle(
+                [cX - text_w//2 - padding, cY - text_h//2 - padding,
+                 cX + text_w//2 + padding, cY + text_h//2 + padding],
+                fill='white',
+                outline=None
+            )
+            
+            # Рисуем номер
+            draw.text(
+                (cX - text_w//2, cY - text_h//2),
+                num_str,
+                fill=(0, 0, 0),
+                font=current_font
+            )
+            placed_positions.append((cX, cY))
     
     # Создание палитры
     palette = create_palette(centers)
@@ -144,16 +200,16 @@ def create_coloring_page(quantized: np.ndarray, centers: np.ndarray, labels_map:
 def create_palette(centers: np.ndarray) -> Image.Image:
     """Создание изображения палитры"""
     n_colors = len(centers)
-    palette_width = 300
+    palette_width = 320
     square_size = 30
-    palette_height = 80 + n_colors * 40
+    palette_height = 80 + n_colors * 38
     
     palette_img = Image.new('RGB', (palette_width, palette_height), 'white')
     palette_draw = ImageDraw.Draw(palette_img)
     
     try:
-        font = ImageFont.truetype("arial.ttf", 14)
-        title_font = ImageFont.truetype("arial.ttf", 16)
+        font = ImageFont.truetype("Arial.ttf", 13)
+        title_font = ImageFont.truetype("Arial.ttf", 16)
     except:
         font = ImageFont.load_default()
         title_font = font
@@ -162,7 +218,7 @@ def create_palette(centers: np.ndarray) -> Image.Image:
     palette_draw.text((10, 38), f"Всего цветов: {n_colors}", fill='gray', font=font)
     
     for idx, color in enumerate(centers, start=1):
-        y_pos = 65 + (idx - 1) * 40
+        y_pos = 65 + (idx - 1) * 38
         color_tuple = tuple(map(int, color))
         
         # Квадрат с цветом
@@ -181,7 +237,7 @@ def create_palette(centers: np.ndarray) -> Image.Image:
         # Кружок с цветом
         r = 8
         palette_draw.ellipse(
-            [255-r, y_pos+square_size//2-r, 255+r, y_pos+square_size//2+r],
+            [275-r, y_pos+square_size//2-r, 275+r, y_pos+square_size//2+r],
             fill=color_tuple,
             outline=(180, 180, 180),
             width=1
@@ -216,20 +272,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '🎨 <b>Бот "Раскраска по номерам"</b>\n\n'
         'Отправьте фото — получите раскраску!\n\n'
         '<b>Команды:</b>\n'
-        '• <code>/colors 12</code> — количество цветов (3-30)\n'
-        '• <code>/detail 200</code> — мин. размер области (50-500)\n'
-        '• <code>/help</code> — справка',
+        '• <code>/colors 24</code> — количество цветов (3-48)\n'
+        '• <code>/detail 150</code> — мин. размер области (50-500)\n'
+        '• <code>/help</code> — справка\n\n'
+        '💡 Больше цветов = больше деталей',
         parse_mode='HTML'
     )
 
 
 async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ <code>/colors 12</code>', parse_mode='HTML')
+        await update.message.reply_text('❌ <code>/colors 24</code>', parse_mode='HTML')
         return
     n_colors = int(context.args[0])
-    if not 3 <= n_colors <= 30:
-        await update.message.reply_text('❌ 3-30 цветов', parse_mode='HTML')
+    if not 3 <= n_colors <= 48:
+        await update.message.reply_text('❌ 3-48 цветов', parse_mode='HTML')
         return
     context.user_data['n_colors'] = n_colors
     await update.message.reply_text(f'✅ {n_colors} цветов')
@@ -237,7 +294,7 @@ async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def set_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ <code>/detail 200</code>', parse_mode='HTML')
+        await update.message.reply_text('❌ <code>/detail 150</code>', parse_mode='HTML')
         return
     min_size = int(context.args[0])
     if not 50 <= min_size <= 500:
@@ -251,7 +308,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message = update.message
     photo = message.photo[-1]
     
-    status_msg = await message.reply_text('🎨 Обрабатываю...')
+    status_msg = await message.reply_text('🎨 Обрабатываю... Это может занять до 30 секунд')
     
     try:
         file = await photo.get_file()
@@ -264,12 +321,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             process_image_for_coloring, bytes(photo_bytes), n_colors, min_size
         )
         
-        await message.reply_photo(coloring_buffer, caption=f'🖼️ Раскраска!\n🎨 Цветов: {n_colors}')
+        await message.reply_photo(coloring_buffer, caption=f'🖼️ Раскраска!\n🎨 Цветов: {n_colors}\n📏 Мин. область: {min_size}px')
         await message.reply_photo(palette_buffer, caption='🎨 Палитра')
         
     except Exception as e:
         logger.error(f'Ошибка: {e}', exc_info=True)
-        await message.reply_text('❌ Ошибка обработки')
+        await message.reply_text('❌ Ошибка обработки. Попробуйте другое фото.')
     finally:
         await status_msg.delete()
 
@@ -279,10 +336,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         '📖 <b>Справка</b>\n\n'
         '<b>Команды:</b>\n'
         '• /start — начать\n'
-        '• /colors N — цветов (3-30)\n'
-        '• /detail N — мин. область (50-500)\n'
+        '• /colors N — цветов (3-48, по умолч. 24)\n'
+        '• /detail N — мин. область в px (50-500, по умолч. 150)\n'
         '• /help — справка\n\n'
-        '💡 Меньше /detail = больше деталей',
+        '<b>Советы:</b>\n'
+        '• Больше цветов = больше деталей\n'
+        '• Меньше мин. область = больше мелких зон\n'
+        '• Для портретов: /colors 30 /detail 100\n'
+        '• Для пейзажей: /colors 20 /detail 200',
         parse_mode='HTML'
     )
 
