@@ -49,7 +49,6 @@ def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> n
     
     return img_array
 
-
 def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, List[Tuple[int, int, int]], np.ndarray]:
     h, w, c = img_array.shape
     pixels = img_array.reshape(-1, c)
@@ -58,7 +57,7 @@ def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, Li
     labels = kmeans.fit_predict(pixels)
     centers = kmeans.cluster_centers_.astype(np.uint8)
     
-    # Сортировка по яркости (используем правильную формулу)
+    # Сортировка по яркости
     brightness = np.array([0.299*c[0] + 0.587*c[1] + 0.114*c[2] for c in centers])
     sorted_indices = np.argsort(brightness)
     centers_sorted = centers[sorted_indices]
@@ -67,40 +66,45 @@ def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, Li
     label_map = {old: new for new, old in enumerate(sorted_indices)}
     labels_mapped = np.array([label_map[l] for l in labels]).reshape(h, w).astype(np.uint8)
     
-    # Медианный фильтр только один раз и меньшим ядром
+    # Медианный фильтр
     if n_colors > 10:
         labels_mapped = cv2.medianBlur(labels_mapped, 3)
     else:
         labels_mapped = cv2.medianBlur(labels_mapped, 5)
     
-    # Удаляем очень маленькие области (острова)
+    # Удаляем очень маленькие области (острова) — ИСПРАВЛЕННАЯ ВЕРСИЯ
     for label in np.unique(labels_mapped):
         mask = (labels_mapped == label).astype(np.uint8) * 255
-        
-        # Находим все компоненты связности для этого цвета
-        # connectedComponentsWithStats возвращает 4 значения: num_labels, labels, stats, centroids
-        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        num_labels, connected_labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
         
         for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] < 30:  # Маленькие острова
-                # Заменяем на цвет большинства соседей
-                y = stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT] // 2
-                x = stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH] // 2
+            if stats[i, cv2.CC_STAT_AREA] < 30:
+                # Создаём маску конкретной маленькой компоненты
+                small_component_mask = (connected_labels == i)
                 
-                # Получаем соседние метки
+                # Ищем координаты этой компоненты
+                ys, xs = np.where(small_component_mask)
+                if len(ys) == 0:
+                    continue
+                
+                # Берём центр компоненты
+                cy, cx = ys[len(ys)//2], xs[len(xs)//2]
+                
+                # Ищем соседние метки вокруг компоненты
                 neighbors = []
-                for dy in [-1, 0, 1]:
-                    for dx in [-1, 0, 1]:
-                        ny, nx = y + dy, x + dx
+                for dy in [-2, -1, 0, 1, 2]:
+                    for dx in [-2, -1, 0, 1, 2]:
+                        ny, nx = cy + dy, cx + dx
                         if 0 <= ny < h and 0 <= nx < w and labels_mapped[ny, nx] != label:
                             neighbors.append(labels_mapped[ny, nx])
                 
                 if neighbors:
                     from collections import Counter
                     most_common = Counter(neighbors).most_common(1)[0][0]
-                    labels_mapped[labels_mapped == label] = most_common
+                    # ✅ Заменяем ТОЛЬКО эту маленькую компоненту
+                    labels_mapped[small_component_mask] = most_common
     
-    return img_array, [tuple(c) for c in centers_sorted], labels_mapped
+    return img_array, [tuple(c) for c in centers_sorted], labels_mapped 
 
 def find_largest_inscribed_circle(mask: np.ndarray):
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
