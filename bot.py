@@ -77,7 +77,34 @@ def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, np
     
     return quantized, labels, [tuple(c) for c in centers]
 
-
+def merge_small_regions(labels: np.ndarray, palette_size: int, 
+                        min_dist: int = 3, min_area: int = 100) -> np.ndarray:
+    """Объединяет близкие области одного цвета с помощью морфологии"""
+    h, w = labels.shape
+    new_labels = labels.copy()
+    
+    # Применяем морфологическую операцию "Закрытие" (Closing) для каждого цвета
+    for color_idx in range(palette_size):
+        mask = (labels == color_idx).astype(np.uint8) * 255
+        
+        # 1. Закрытие: убирает мелкие дырочки и объединяет соседние островки
+        kernel = np.ones((min_dist, min_dist), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        
+        # 2. Открытие: убирает мелкий шум
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        
+        # Фильтрация по площади с помощью ConnectedComponents
+        num_labels, labels_img, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] < min_area:
+                mask[labels_img == i] = 0
+        
+        # Эта маска заменяет пятна. Остальные пиксели будут позже заполнены.
+        new_labels[mask > 0] = color_idx
+        
+    return new_labels
+                            
 def find_connected_regions(mask: np.ndarray, min_size: int = 100) -> List[Tuple[List[int], List[int], int, int]]:
     """Поиск связных областей через BFS"""
     h, w = mask.shape
@@ -257,8 +284,8 @@ def process_image_for_coloring(photo_bytes: bytes, n_colors: int, min_region_siz
     img_array = preprocess_image(image, max_image_size, preprocess_strength)
     
     quantized, labels, palette = cluster_colors(img_array, n_colors)
-    coloring_img = create_coloring_page(quantized, palette, min_region_size, 
-                                       line_thickness, line_color, font_size)
+    labels = merge_small_regions(labels, len(palette), min_dist=4, min_area=int(min_region_size * 0.7))
+    coloring_img = create_coloring_page(quantized, palette, min_region_size, line_thickness, line_color, font_size)
     palette_img = create_palette_image(palette)
     
     coloring_buffer = io.BytesIO()
