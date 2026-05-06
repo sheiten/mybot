@@ -3,7 +3,9 @@ import logging
 import os
 import io
 import math
-from typing import List, Tuple, Optional
+import ssl
+import urllib.request
+from typing import List, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -12,8 +14,6 @@ import cv2
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Для SLIC (суперпиксели)
-from skimage.segmentation import slic
 # Для векторной графики
 import svgwrite
 
@@ -33,8 +33,25 @@ DEFAULT_PREPROCESS_STRENGTH = 'medium'
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ============================================
+# ФУНКЦИЯ ОБНОВЛЕНИЯ ЧЕРЕZ PORTAINER
+# ============================================
+def trigger_self_update():
+    webhook_url = "https://2.26.116"  # Укажите ваш URL вебхука Portainer
+    ctx = ssl._create_unverified_context()
+    try:
+        req = urllib.request.Request(webhook_url, method='POST')
+        with urllib.request.urlopen(req, context=ctx) as response:
+            return response.getcode() == 204
+    except Exception as e:
+        logger.error(f"Ошибка обновления: {e}")
+        return False
+
+# ============================================
+# ОСНОВНЫЕ ФУНКЦИИ ОБРАБОТКИ ИЗОБРАЖЕНИЙ
+# ============================================
 def preprocess_image(image: Image.Image, target_size: int, strength: str = 'medium') -> np.ndarray:
-    """Предобработка: изменение размера, медианное размытие для уничтожения текстур"""
+    """Предобработка: изменение размера, медианное размытие"""
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
@@ -45,18 +62,17 @@ def preprocess_image(image: Image.Image, target_size: int, strength: str = 'medi
     
     img_array = np.array(image)
     
-    # Медианное размытие — это ключ к крупным областям
     if strength == 'light':
         img_array = cv2.medianBlur(img_array, 5)
     elif strength == 'medium':
         img_array = cv2.medianBlur(img_array, 7)
-    else:  # strong
+    else:
         img_array = cv2.medianBlur(img_array, 11)
     
     return img_array
 
 def cluster_colors_rgb(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int, int, int]]]:
-    """Квантование цветов в RGB с сортировкой по яркости"""
+    """Квантование цветов KMeans"""
     h, w = img_array.shape[:2]
     pixels = img_array.reshape((-1, 3))
     
@@ -64,105 +80,46 @@ def cluster_colors_rgb(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray
     labels = kmeans.fit_predict(pixels)
     centers = kmeans.cluster_centers_.astype(int)
     
-    # Сортировка по яркости
     brightness = 0.299 * centers[:, 0] + 0.587 * centers[:, 1] + 0.114 * centers[:, 2]
     sorted_indices = np.argsort(brightness)
     centers = centers[sorted_indices]
     
-    # Переназначаем метки
     label_map = {old: new for new, old in enumerate(sorted_indices)}
     labels = np.array([label_map[l] for l in labels]).reshape((h, w))
     
     quantized = centers[labels]
     return quantized, labels, [tuple(c) for c in centers]
 
-def apply_superpixels(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
-                      min_region_size: int) -> np.ndarray:
-    """
-    Разбивает изображение на суперпиксели (SLIC) и переназначает цвета
-    на ближайший из палитры. Это создаёт крупные, связные области.
-    """
+def merge_with_morphology(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
+                          min_region_size: int) -> np.ndarray:
+    """Объединяет мелкие регионы в крупные с помощью морфологии OpenCV"""
     h, w = quantized.shape[:2]
-    
-    # Количество суперпикселей: примерно 1 на каждые 2000-3000 пикселей
-    # Чем больше min_region_size, тем меньше сегментов
-    n_segments = max(100, int((h * w) / (min_region_size * 2)))
-    
-    # SLIC (Simple Linear Iterative Clustering)
-    # compactness=30 даёт более квадратные/округлые формы
-    segments = slic(quantized, n_segments=n_segments, compactness=30, sigma=1, start_label=1)
-    
-    # Создаём новое изображение, где каждый суперпиксель закрашен ближайшим цветом из палитры
     new_quantized = quantized.copy()
     palette_np = np.array(palette)
     
-    for seg_id in np.unique(segments):
-        mask = segments == seg_id
-        if not np.any(mask):
-            continue
-        
-        # Находим средний цвет пикселей в этом суперпикселе
-        pixels_in_seg = quantized[mask]
-        avg_color = np.mean(pixels_in_seg, axis=0).astype(int)
-        
-        # Находим ближайший цвет из палитры (евклидово расстояние)
-        distances = np.linalg.norm(palette_np - avg_color, axis=1)
-        closest_idx = np.argmin(distances)
-        
-        # Закрашиваем весь суперпиксель этим цветом
-        new_quantized[mask] = palette_np[closest_idx]
-    
-    return new_quantized
-
-def find_regions_with_merging(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
-                             min_region_size: int) -> List[Tuple[np.ndarray, int, int]]:
-    """
-    Находит все связные области. Если область меньше min_region_size,
-    она присоединяется к соседней большой области того же цвета.
-    Возвращает список: (маска области, центр_x, центр_y)
-    """
-    h, w = quantized.shape[:2]
-    regions = []
-    
-    # Для каждого цвета в палитре
     for color_idx, color in enumerate(palette):
         color_np = np.array(color)
-        # Маска пикселей этого цвета
         mask = np.all(quantized == color_np, axis=2).astype(np.uint8) * 255
         
-        # Находим все связные компоненты
-        num_labels, labels_img, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        kernel_close = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+        kernel_open = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
         
-        # Собираем большие и мелкие компоненты
-        large_components = []
-        small_components = []
-        
+        num_labels, labels_img, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
-            if area >= min_region_size:
-                # Большой компонент
-                large_components.append((i, area, centroids[i]))
-            else:
-                # Мелкий компонент — будет присоединён к большому
-                small_components.append((i, area, centroids[i]))
+            if area < min_region_size * 0.5:
+                mask[labels_img == i] = 0
         
-        # Обрабатываем большие компоненты
-        for comp_id, area, centroid in large_components:
-            mask_comp = (labels_img == comp_id).astype(bool)
-            regions.append((mask_comp, int(centroid[0]), int(centroid[1])))
-        
-        # ПРИСОЕДИНЯЕМ МЕЛКИЕ К БОЛЬШИМ
-        # Для каждого мелкого компонента находим соседний большой того же цвета
-        # и добавляем его пиксели к большой области
-        # (Для простоты и скорости: просто оставляем мелкие, если они есть, 
-        #  но в следующем проходе фильтрации они будут объединены)
-        
-    return regions
+        new_quantized[mask > 0] = color_np
+    
+    return new_quantized
 
 def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
                                 min_region_size: int, line_thickness: int, 
                                 line_color: str, font_size: int) -> io.BytesIO:
-    """Создаёт векторную раскраску (SVG) с контурами и номерами"""
+    """Создаёт векторную раскраску SVG с контурами и номерами"""
     h, w = quantized.shape[:2]
     
     color_map = {
@@ -220,8 +177,6 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
                 size=(text_width + 4, text_height + 4),
                 fill='white'
             ))
-            
-            # 👇 ЗДЕСЬ УБРАЛИ dominant_baseline
             dwg.add(dwg.text(
                 num_str,
                 insert=(cx, cy + font_size * 0.35),
@@ -230,7 +185,6 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
                 font_family=font_family,
                 text_anchor='middle'
             ))
-            
             placed_positions.append((cx, cy))
     
     output = io.BytesIO()
@@ -239,7 +193,7 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
     return output
 
 def create_palette_image(palette: List[Tuple[int, int, int]]) -> Image.Image:
-    """Создание изображения палитры"""
+    """Палитра"""
     n_colors = len(palette)
     palette_width = 300
     palette_height = 70 + n_colors * 35
@@ -266,9 +220,7 @@ def create_palette_image(palette: List[Tuple[int, int, int]]) -> Image.Image:
             outline=(180, 180, 180),
             width=1
         )
-        
         palette_draw.text((50, y_pos + 4), f"{idx}.", fill='black', font=font)
-        
         hex_color = f'#{color[0]:02x}{color[1]:02x}{color[2]:02x}'
         palette_draw.text((90, y_pos + 4), hex_color, fill='gray', font=font)
     
@@ -277,23 +229,17 @@ def create_palette_image(palette: List[Tuple[int, int, int]]) -> Image.Image:
 def process_image_for_coloring(photo_bytes: bytes, n_colors: int, min_region_size: int,
                                line_thickness: int, line_color: str, font_size: int,
                                max_image_size: int, preprocess_strength: str) -> Tuple[io.BytesIO, io.BytesIO]:
-    """Основная функция обработки с полным пайплайном"""
+    """Основная функция обработки"""
     image = Image.open(io.BytesIO(photo_bytes))
     img_array = preprocess_image(image, max_image_size, preprocess_strength)
     
-    # 1. Квантование цветов (KMeans)
     quantized, labels, palette = cluster_colors_rgb(img_array, n_colors)
+    quantized = merge_with_morphology(quantized, palette, min_region_size)
     
-    # 2. Применение суперпикселей (SLIC) для создания крупных связных областей
-    quantized = apply_superpixels(quantized, palette, min_region_size)
-    
-    # 3. Создание векторной раскраски с контурами и номерами
-    # Используем векторный формат SVG для идеальных линий
     coloring_buffer = create_coloring_page_vector(
         quantized, palette, min_region_size, line_thickness, line_color, font_size
     )
     
-    # 4. Палитра
     palette_buffer = io.BytesIO()
     palette_img = create_palette_image(palette)
     palette_img.save(palette_buffer, format='PNG', dpi=(300, 300))
@@ -301,10 +247,13 @@ def process_image_for_coloring(photo_bytes: bytes, n_colors: int, min_region_siz
     
     return coloring_buffer, palette_buffer
 
-# Функции бота (остаются без изменений, работают с новым процессом)
+# ============================================
+# ФУНКЦИИ БОТА
+# ============================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        '🎨 <b>Бот "Раскраска по номерам v2.0 (Профессиональный)</b>\n\n'
+        '🎨 <b>Бот "Раскраска по номерам" (v2.1 Professional)</b>\n\n'
         'Отправьте фото — получите раскраску!\n\n'
         '<b>Основные команды:</b>\n'
         '• <code>/colors 24</code> — количество цветов (3-48)\n'
@@ -316,7 +265,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '• <code>/size 1500</code> — макс. размер изображения (800-3000)\n'
         '• <code>/smooth medium</code> — сглаживание (light/medium/strong)\n'
         '• <code>/settings</code> — показать текущие настройки\n'
-        '• <code>/help</code> — подробная справка',
+        '• <code>/help</code> — подробная справка\n'
+        '• <code>/myid</code> — узнать свой ID (для админа)\n'
+        '• <code>/update</code> — перезапустить бота (только для админа)',
         parse_mode='HTML'
     )
 
@@ -407,6 +358,34 @@ async def set_smooth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     names = {'light': 'слабое', 'medium': 'среднее', 'strong': 'сильное'}
     await update.message.reply_text(f'✅ Сглаживание: {names[strength]}')
 
+# ============================================
+# НОВЫЕ КОМАНДЫ
+# ============================================
+
+# ВАЖНО: Замените 1234567890 на ваш реальный Telegram ID
+# Чтобы узнать свой ID, отправьте боту /myid
+ADMIN_ID = 1234567890  # <--- ЗАМЕНИТЕ НА ВАШ ID
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    await update.message.reply_text(f'🆔 Ваш Telegram ID: <code>{user_id}</code>', parse_mode='HTML')
+
+async def update_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text('❌ У вас нет прав для этой команды.')
+        return
+    
+    await update.message.reply_text('🚀 Запускаю обновление стека...')
+    if trigger_self_update():
+        await update.message.reply_text('✅ Portainer принял запрос. Контейнер будет перезапущен.')
+    else:
+        await update.message.reply_text('❌ Ошибка при отправке запроса в Portainer.')
+
+# ============================================
+# ОБРАБОТКА ФОТО
+# ============================================
+
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     photo = message.photo[-1]
@@ -425,7 +404,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f'🔤 Шрифт: {font_size} | 🌊 Сглаж: {preprocess_strength}'
     )
     
-    status_msg = await message.reply_text(f'🎨 Создаю раскраску (Профессиональный режим)...\n\n{settings_text}')
+    status_msg = await message.reply_text(f'🎨 Создаю раскраску...\n\n{settings_text}')
     
     try:
         file = await photo.get_file()
@@ -436,14 +415,11 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             line_thickness, line_color, font_size, max_image_size, preprocess_strength
         )
         
-        # Отправляем как документ (SVG) для сохранения векторного качества
         await message.reply_document(
             document=coloring_buffer,
             filename='coloring_page.svg',
             caption=f'🖼️ Раскраска (SVG)\n{settings_text}'
         )
-        
-        # Отправляем палитру
         await message.reply_photo(palette_buffer, caption='🎨 Палитра')
         
     except Exception as e:
@@ -454,7 +430,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        '📖 <b>Полная справка (v2.0)</b>\n\n'
+        '📖 <b>Полная справка (v2.1)</b>\n\n'
         '<b>Основные команды:</b>\n'
         '• <code>/colors N</code> — цветов (3-48, по умолч. 24)\n'
         '• <code>/detail N</code> — мин. область (50-500, по умолч. 150)\n\n'
@@ -464,12 +440,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         '• <code>/font N</code> — размер шрифта (9-14, по умолч. 11)\n'
         '• <code>/size N</code> — макс. размер (800-3000, по умолч. 1500)\n'
         '• <code>/smooth X</code> — сглаживание (light/medium/strong)\n'
-        '• <code>/settings</code> — показать настройки\n\n'
-        '<b>Рекомендации:</b>\n'
-        '• Для портретов: /colors 30 /detail 100 /smooth light\n'
-        '• Для пейзажей: /colors 20 /detail 200 /smooth medium',
+        '• <code>/settings</code> — показать настройки\n'
+        '• <code>/myid</code> — узнать свой ID (для админа)\n'
+        '• <code>/update</code> — перезапустить бота (только для админа)',
         parse_mode='HTML'
     )
+
+# ============================================
+# MAIN
+# ============================================
 
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
@@ -484,9 +463,11 @@ def main() -> None:
     application.add_handler(CommandHandler('font', set_font_size))
     application.add_handler(CommandHandler('size', set_max_size))
     application.add_handler(CommandHandler('smooth', set_smooth))
+    application.add_handler(CommandHandler('myid', myid))
+    application.add_handler(CommandHandler('update', update_bot))
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
     
-    logger.info('🎨 Бот запущен (v2.0 Professional)!')
+    logger.info('🎨 Бот запущен (v2.1 Professional)!')
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
