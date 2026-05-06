@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🎨 Paint by Numbers Bot v3.0 Professional
+Telegram bot for generating paint-by-number coloring pages from images.
+
+Features:
+• LAB color space clustering for perceptually accurate colors
+• Spatial-aware KMeans for coherent regions
+• Smart small-region merging with neighbor analysis
+• Distance-transform based number placement
+• SVG/PNG dual export support
+• Production-ready error handling & security
+"""
+
 import asyncio
 import logging
 import os
@@ -5,482 +20,915 @@ import io
 import math
 import ssl
 import urllib.request
-from typing import List, Tuple
+import json
+from dataclasses import dataclass, field, asdict
+from typing import List, Tuple, Optional, Dict, Union
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
+from scipy import stats as sp_stats
 import cv2
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Для векторной графики
-import svgwrite
+# ============================================
+# CONFIGURATION & CONSTANTS
+# ============================================
 
 TOKEN = os.environ.get('BOT_TOKEN', '')
 if not TOKEN:
     raise ValueError('BOT_TOKEN environment variable is not set!')
 
-# Настройки по умолчанию
-DEFAULT_N_COLORS = 24
-DEFAULT_MIN_REGION_SIZE = 150
-DEFAULT_MAX_IMAGE_SIZE = 1500
-DEFAULT_LINE_THICKNESS = 1
-DEFAULT_LINE_COLOR = 'gray'
-DEFAULT_FONT_SIZE = 11
-DEFAULT_PREPROCESS_STRENGTH = 'medium'
+# Security: External config via env vars only
+PORTAINER_WEBHOOK_URL = os.environ.get('PORTAINER_WEBHOOK_URL', '')
+PORTAINER_TOKEN = os.environ.get('PORTAINER_TOKEN', '')
+ADMIN_ID = int(os.environ.get('ADMIN_USER_ID', '931848809'))
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+DEFAULT_CONFIG = {
+    'n_colors': 24,
+    'min_region_size': 150,
+    'max_image_size': 1500,
+    'line_thickness': 1,
+    'line_color': 'gray',
+    'font_size': 11,
+    'preprocess_strength': 'medium',
+    'color_space': 'lab',  # 'rgb' or 'lab'
+    'spatial_weight': 0.1,
+    'use_minibatch': True,
+    'export_svg': False,
+}
+
+LINE_COLORS = {
+    'gray': (180, 180, 180),
+    'dark': (100, 100, 100),
+    'light': (210, 210, 210),
+    'black': (0, 0, 0),
+}
+
+# Logging setup
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('pbn_bot.log', encoding='utf-8')
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# ============================================
-# ФУНКЦИЯ ОБНОВЛЕНИЯ ЧЕРЕZ PORTAINER
-# ============================================
-def trigger_self_update():
-    webhook_url = "https://2.26.116"  # Укажите ваш URL вебхука Portainer
-    ctx = ssl._create_unverified_context()
-    try:
-        req = urllib.request.Request(webhook_url, method='POST')
-        with urllib.request.urlopen(req, context=ctx) as response:
-            return response.getcode() == 204
-    except Exception as e:
-        logger.error(f"Ошибка обновления: {e}")
-        return False
 
 # ============================================
-# ОСНОВНЫЕ ФУНКЦИИ ОБРАБОТКИ ИЗОБРАЖЕНИЙ
+# DATA CLASSES
 # ============================================
-def preprocess_image(image: Image.Image, target_size: int, strength: str = 'medium') -> np.ndarray:
-    """Предобработка: изменение размера, медианное размытие"""
+
+@dataclass
+class PBNConfig:
+    """Configuration for Paint by Numbers generation"""
+    n_colors: int = 24
+    min_region_size: int = 150
+    max_image_size: int = 1500
+    line_thickness: int = 1
+    line_color: str = 'gray'
+    font_size: int = 11
+    preprocess_strength: str = 'medium'
+    color_space: str = 'lab'
+    spatial_weight: float = 0.1
+    use_minibatch: bool = True
+    export_svg: bool = False
+    
+    @property
+    def line_rgb(self) -> Tuple[int, int, int]:
+        return LINE_COLORS.get(self.line_color, LINE_COLORS['gray'])
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'PBNConfig':
+        """Create config from dict, filtering unknown keys"""
+        valid_keys = cls.__annotations__.keys()
+        return cls(**{k: v for k, v in data.items() if k in valid_keys})
+    
+    @classmethod
+    def from_user_data(cls, user_data: dict) -> 'PBNConfig':
+        """Create config from Telegram user_data"""
+        return cls.from_dict(user_data)
+
+
+# ============================================
+# SECURITY & UTILS
+# ============================================
+
+def trigger_self_update() -> bool:
+    """Secure webhook trigger for Portainer update"""
+    if not PORTAINER_WEBHOOK_URL or not PORTAINER_TOKEN:
+        logger.error("Portainer credentials not configured")
+        return False
+    
+    try:
+        # Create verified SSL context
+        ctx = ssl.create_default_context()
+        
+        req = urllib.request.Request(
+            PORTAINER_WEBHOOK_URL,
+            method='POST',
+            headers={
+                'Authorization': f'Bearer {PORTAINER_TOKEN}',
+                'Content-Type': 'application/json',
+                'User-Agent': 'PBN-Bot/3.0'
+            },
+            data=json.dumps({'action': 'redeploy'}).encode('utf-8')
+        )
+        
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+            return response.status in (200, 204)
+            
+    except urllib.error.HTTPError as e:
+        logger.error(f"HTTP error {e.code}: {e.reason}")
+        return False
+    except Exception as e:
+        logger.error(f"Update webhook error: {type(e).__name__}: {e}")
+        return False
+
+
+def get_font(size: int) -> ImageFont.FreeTypeFont:
+    """Cross-platform font loader with fallbacks"""
+    font_candidates = [
+        "Arial.ttf",
+        "arial.ttf",
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+        Path("/System/Library/Fonts/Helvetica.ttc"),
+        Path("C:\\Windows\\Fonts\\arial.ttf"),
+        Path("C:\\Windows\\Fonts\\seguiemj.ttf"),  # Windows emoji font fallback
+    ]
+    
+    for font_path in font_candidates:
+        try:
+            return ImageFont.truetype(str(font_path), size)
+        except (IOError, OSError, ValueError):
+            continue
+    
+    logger.warning("No TrueType font found, using default bitmap font")
+    return ImageFont.load_default()
+
+
+# ============================================
+# IMAGE PREPROCESSING
+# ============================================
+
+def preprocess_image(image: Image.Image, target_size: int, 
+                    strength: str = 'medium') -> np.ndarray:
+    """
+    Preprocess image: resize, denoise, prepare for clustering.
+    Returns numpy array in RGB format.
+    """
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
+    # Smart resize preserving aspect ratio
     width, height = image.size
     if max(width, height) > target_size:
         ratio = target_size / max(width, height)
-        image = image.resize((int(width * ratio), int(height * ratio)), Image.Resampling.LANCZOS)
+        new_size = (int(width * ratio), int(height * ratio))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
     
     img_array = np.array(image)
     
-    if strength == 'light':
-        img_array = cv2.medianBlur(img_array, 5)
-    elif strength == 'medium':
-        img_array = cv2.medianBlur(img_array, 7)
-    else:
-        img_array = cv2.medianBlur(img_array, 11)
+    # Adaptive denoising based on strength
+    denoise_params = {
+        'light': {'d': 5, 'sigmaColor': 50, 'sigmaSpace': 50},
+        'medium': {'d': 9, 'sigmaColor': 75, 'sigmaSpace': 75},
+        'strong': {'d': 15, 'sigmaColor': 100, 'sigmaSpace': 100},
+    }
+    params = denoise_params.get(strength, denoise_params['medium'])
+    
+    # Bilateral filter preserves edges while smoothing
+    img_array = cv2.bilateralFilter(img_array, **params)
     
     return img_array
 
-def cluster_colors_rgb(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int, int, int]]]:
-    """Квантование цветов KMeans"""
+
+# ============================================
+# COLOR CLUSTERING (LAB + SPATIAL)
+# ============================================
+
+def cluster_colors(img_array: np.ndarray, config: PBNConfig) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int, int, int]]]:
+    """
+    Cluster colors using KMeans in LAB or RGB space with optional spatial weighting.
+    Returns: (quantized_image, label_map, palette_colors_rgb)
+    """
     h, w = img_array.shape[:2]
-    pixels = img_array.reshape((-1, 3))
+    total_pixels = h * w
     
-    kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10, max_iter=300)
-    labels = kmeans.fit_predict(pixels)
-    centers = kmeans.cluster_centers_.astype(int)
+    # Choose color space
+    if config.color_space == 'lab':
+        img_processed = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB).astype(np.float32)
+        convert_back = lambda centers: cv2.cvtColor(
+            centers.astype(np.uint8).reshape(-1, 1, 3), 
+            cv2.COLOR_LAB2RGB
+        ).reshape(-1, 3)
+    else:
+        img_processed = img_array.astype(np.float32)
+        convert_back = lambda centers: centers
     
-    brightness = 0.299 * centers[:, 0] + 0.587 * centers[:, 1] + 0.114 * centers[:, 2]
+    # Prepare features: [color_channels, optional_spatial]
+    if config.spatial_weight > 0:
+        # Normalized coordinates
+        y_coords, x_coords = np.mgrid[0:h, 0:w]
+        x_norm = (x_coords / w).astype(np.float32) * config.spatial_weight
+        y_norm = (y_coords / h).astype(np.float32) * config.spatial_weight
+        
+        features = np.stack([
+            img_processed[:, :, 0].ravel(),
+            img_processed[:, :, 1].ravel(),
+            img_processed[:, :, 2].ravel(),
+            x_norm.ravel(),
+            y_norm.ravel()
+        ], axis=1)
+        color_dims = 3
+    else:
+        features = img_processed.reshape(-1, 3)
+        color_dims = 3
+    
+    # Choose clustering algorithm based on image size
+    use_minibatch = config.use_minibatch and total_pixels > 300_000
+    
+    if use_minibatch:
+        # Sample for MiniBatchKMeans fitting
+        sample_size = min(50_000, total_pixels)
+        sample_indices = np.random.choice(total_pixels, sample_size, replace=False)
+        sample_features = features[sample_indices]
+        
+        kmeans = MiniBatchKMeans(
+            n_clusters=config.n_colors,
+            batch_size=1000,
+            random_state=42,
+            n_init=3,
+            max_iter=100
+        )
+        kmeans.fit(sample_features)
+        labels = kmeans.predict(features).reshape(h, w)
+    else:
+        # Full KMeans for smaller images
+        kmeans = KMeans(
+            n_clusters=config.n_colors,
+            random_state=42,
+            n_init=10,
+            max_iter=300
+        )
+        labels = kmeans.fit_predict(features).reshape(h, w)
+    
+    # Extract and convert centers to RGB
+    centers = kmeans.cluster_centers_[:, :color_dims]  # Only color dimensions
+    centers_rgb = convert_back(centers).astype(np.uint8)
+    
+    # Sort palette by brightness for intuitive numbering
+    brightness = 0.299 * centers_rgb[:, 0] + 0.587 * centers_rgb[:, 1] + 0.114 * centers_rgb[:, 2]
     sorted_indices = np.argsort(brightness)
-    centers = centers[sorted_indices]
     
+    # Remap labels to sorted order
     label_map = {old: new for new, old in enumerate(sorted_indices)}
-    labels = np.array([label_map[l] for l in labels]).reshape((h, w))
+    labels = np.vectorize(label_map.get)(labels)
+    centers_rgb = centers_rgb[sorted_indices]
     
-    quantized = centers[labels]
-    return quantized, labels, [tuple(c) for c in centers]
+    # Reconstruct quantized image
+    quantized = centers_rgb[labels]
+    
+    return quantized, labels, [tuple(c) for c in centers_rgb]
 
-def merge_with_morphology(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
-                          min_region_size: int) -> np.ndarray:
-    """Объединяет мелкие регионы в крупные с помощью морфологии OpenCV"""
+
+# ============================================
+# REGION MERGING & CLEANUP
+# ============================================
+
+def merge_small_regions(quantized: np.ndarray, labels: np.ndarray, 
+                       palette: List[Tuple[int, int, int]], 
+                       min_area: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Merge regions smaller than min_area with their most similar neighbor.
+    Returns: (cleaned_quantized, cleaned_labels)
+    """
     h, w = quantized.shape[:2]
+    new_labels = labels.copy()
     new_quantized = quantized.copy()
-    palette_np = np.array(palette)
     
+    # Process each color channel separately for connected components
     for color_idx, color in enumerate(palette):
-        color_np = np.array(color)
-        mask = np.all(quantized == color_np, axis=2).astype(np.uint8) * 255
+        color_mask = (labels == color_idx).astype(np.uint8)
         
-        kernel_close = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
-        kernel_open = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        # Morphological cleanup
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         
-        num_labels, labels_img, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            if area < min_region_size * 0.5:
-                mask[labels_img == i] = 0
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
         
-        new_quantized[mask > 0] = color_np
-    
-    return new_quantized
-
-def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
-                               min_region_size: int, line_thickness: int, 
-                               line_color: str, font_size: int) -> io.BytesIO:
-    """Создаёт растровую раскраску PNG с контурами и номерами"""
-    h, w = quantized.shape[:2]
-    
-    # Цвет линий
-    color_map = {
-        'gray': [180, 180, 180],
-        'dark': [100, 100, 100],
-        'light': [210, 210, 210]
-    }
-    line_rgb = color_map.get(line_color, [180, 180, 180])
-    
-    # Создаём белый холст
-    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
-    
-    # Для каждого цвета находим контуры
-    for color_idx, color in enumerate(palette):
-        color_np = np.array(color)
-        mask = np.all(quantized == color_np, axis=2).astype(np.uint8) * 255
+        # Find connected components
+        num_labels, comp_labels, stats, _ = cv2.connectedComponentsWithStats(
+            color_mask, connectivity=8, ltype=cv2.CV_32S
+        )
         
-        contours, hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < min_region_size:
-                continue
+        for comp_id in range(1, num_labels):  # Skip background (0)
+            area = stats[comp_id, cv2.CC_STAT_AREA]
             
-            # Рисуем контур на холсте
-            cv2.drawContours(canvas, [contour], -1, line_rgb, line_thickness)
+            if area < min_area:
+                # Create mask for this small component
+                comp_mask = (comp_labels == comp_id)
+                
+                # Find boundary pixels (dilate - original)
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                dilated = cv2.dilate(comp_mask.astype(np.uint8), kernel)
+                boundary = dilated - comp_mask.astype(np.uint8)
+                
+                if np.sum(boundary) > 0:
+                    # Get neighbor colors
+                    neighbor_colors = new_labels[boundary > 0]
+                    
+                    if len(neighbor_colors) > 0:
+                        # Find most frequent neighbor color
+                        neighbor_counts = np.bincount(neighbor_colors.flatten())
+                        dominant_neighbor = np.argmax(neighbor_counts)
+                        
+                        # Merge: assign to dominant neighbor
+                        new_labels[comp_mask] = dominant_neighbor
+                        new_quantized[comp_mask] = palette[dominant_neighbor]
     
-    # Преобразуем в PIL для рисования номеров
-    pil_canvas = Image.fromarray(canvas)
-    draw = ImageDraw.Draw(pil_canvas)
+    return new_quantized, new_labels
+
+
+# ============================================
+# SMART NUMBER PLACEMENT
+# ============================================
+
+def find_optimal_number_position(contour: np.ndarray, mask: np.ndarray, 
+                                font_size: int, placed_positions: List[Tuple[int, int]],
+                                min_distance_factor: float = 2.5) -> Optional[Tuple[int, int]]:
+    """
+    Find optimal position for number inside region using distance transform.
+    Avoids boundaries and other numbers.
+    """
+    if len(contour) < 3:
+        return None
     
-    try:
-        font = ImageFont.truetype("Arial.ttf", font_size)
-    except:
-        font = ImageFont.load_default()
+    # Try centroid first
+    M = cv2.moments(contour)
+    if M["m00"] == 0:
+        return None
+    
+    cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+    
+    # Check distance to boundary
+    dist_to_boundary = cv2.pointPolygonTest(contour, (cx, cy), True)
+    min_margin = font_size * 2
+    
+    if dist_to_boundary < min_margin:
+        # Use distance transform to find best interior point
+        dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        
+        # Create search mask: only points far from boundary
+        search_mask = (dist_transform >= min_margin).astype(np.uint8)
+        
+        if np.sum(search_mask) == 0:
+            # Fallback: use point with max distance even if close to boundary
+            max_loc = np.argmax(dist_transform)
+            cy, cx = np.unravel_index(max_loc, dist_transform.shape)
+        else:
+            # Mask the distance transform
+            masked_dist = dist_transform * search_mask
+            max_loc = np.argmax(masked_dist)
+            cy, cx = np.unravel_index(max_loc, masked_dist.shape)
+    
+    # Check for collisions with other placed numbers
+    min_dist = font_size * min_distance_factor
+    for px, py in placed_positions:
+        if math.hypot(cx - px, cy - py) < min_dist:
+            # Try to nudge away from collision
+            angle = math.atan2(cy - py, cx - px) + math.pi
+            cx += int(min_dist * 0.5 * math.cos(angle))
+            cy += int(min_dist * 0.5 * math.sin(angle))
+            
+            # Verify new position is still inside contour
+            if cv2.pointPolygonTest(contour, (cx, cy), False) < 0:
+                return None  # Can't place without collision
+            break
+    
+    return cx, cy
+
+
+# ============================================
+# CONTOUR & SVG GENERATION
+# ============================================
+
+def simplify_contour(contour: np.ndarray, epsilon_factor: float = 0.01) -> np.ndarray:
+    """Simplify contour using Ramer-Douglas-Peucker algorithm"""
+    perimeter = cv2.arcLength(contour, True)
+    epsilon = epsilon_factor * perimeter
+    return cv2.approxPolyDP(contour, epsilon, True)
+
+
+def contour_to_svg_path(contour: np.ndarray) -> str:
+    """Convert OpenCV contour to SVG path data string"""
+    if len(contour) < 2:
+        return ""
+    
+    simplified = simplify_contour(contour)
+    
+    # Build SVG path commands
+    path_d = f"M {simplified[0][0][0]},{simplified[0][0][1]}"
+    for point in simplified[1:]:
+        x, y = point[0]
+        path_d += f" L {x},{y}"
+    path_d += " Z"  # Close path
+    
+    return path_d
+
+
+def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
+                       config: PBNConfig) -> str:
+    """Generate SVG format coloring page"""
+    h, w = quantized.shape[:2]
+    line_rgb = config.line_rgb
+    font_size = config.font_size
+    
+    # SVG header
+    svg_parts = [
+        f'<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
+        f'<rect width="100%" height="100%" fill="white"/>',
+        f'<style>.region{{fill:none;stroke:rgb{line_rgb};stroke-width:{config.line_thickness};stroke-linejoin:round}}</style>',
+    ]
     
     placed_positions = []
     
     for color_idx, color in enumerate(palette):
-        color_np = np.array(color)
-        mask = np.all(quantized == color_np, axis=2).astype(np.uint8) * 255
+        color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
         
-        contours, hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < min_region_size:
+            if area < config.min_region_size:
                 continue
             
-            M = cv2.moments(contour)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-            else:
-                continue
+            # Add contour path
+            path_d = contour_to_svg_path(contour)
+            if path_d:
+                svg_parts.append(f'<path class="region" d="{path_d}"/>')
             
-            too_close = False
-            for px, py in placed_positions:
-                if math.sqrt((cx - px) ** 2 + (cy - py) ** 2) < font_size * 3:
-                    too_close = True
-                    break
-            if too_close:
-                continue
-            
-            num_str = str(color_idx + 1)
-            bbox = draw.textbbox((0, 0), num_str, font=font)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-            
-            padding = 2
-            draw.rectangle(
-                [cx - text_w // 2 - padding, cy - text_h // 2 - padding,
-                 cx + text_w // 2 + padding, cy + text_h // 2 + padding],
-                fill='white',
-                outline=None
-            )
-            draw.text((cx - text_w // 2, cy - text_h // 2), num_str, fill=(0, 0, 0), font=font)
-            placed_positions.append((cx, cy))
+            # Place number
+            pos = find_optimal_number_position(contour, color_mask, font_size, placed_positions)
+            if pos:
+                cx, cy = pos
+                num_str = str(color_idx + 1)
+                
+                # White background circle for readability
+                svg_parts.append(f'<circle cx="{cx}" cy="{cy}" r="{font_size//2 + 2}" fill="white"/>')
+                svg_parts.append(f'<text x="{cx}" y="{cy}" text-anchor="middle" dominant-baseline="central" '
+                               f'font-size="{font_size}" font-family="Arial" fill="black">{num_str}</text>')
+                placed_positions.append((cx, cy))
     
+    svg_parts.append('</svg>')
+    return '\n'.join(svg_parts)
+
+
+# ============================================
+# RASTER OUTPUT GENERATION
+# ============================================
+
+def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
+                               config: PBNConfig) -> io.BytesIO:
+    """Generate PNG coloring page with contours and numbers"""
+    h, w = quantized.shape[:2]
+    line_rgb = config.line_rgb
+    font_size = config.font_size
+    
+    # White canvas
+    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
+    font = get_font(font_size)
+    
+    placed_positions = []
+    
+    for color_idx, color in enumerate(palette):
+        color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
+        
+        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < config.min_region_size:
+                continue
+            
+            # Draw contour
+            cv2.drawContours(canvas, [contour], -1, line_rgb, config.line_thickness)
+            
+            # Place number
+            pos = find_optimal_number_position(contour, color_mask, font_size, placed_positions)
+            if pos:
+                cx, cy = pos
+                num_str = str(color_idx + 1)
+                
+                # Calculate text bounds for background
+                bbox = font.getbbox(num_str) if hasattr(font, 'getbbox') else (0, 0, font_size, font_size)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                
+                # White background rectangle
+                padding = 2
+                draw = ImageDraw.Draw(Image.fromarray(canvas))
+                draw.rectangle(
+                    [cx - text_w // 2 - padding, cy - text_h // 2 - padding,
+                     cx + text_w // 2 + padding, cy + text_h // 2 + padding],
+                    fill='white'
+                )
+                draw.text((cx - text_w // 2, cy - text_h // 2), num_str, fill='black', font=font)
+                
+                # Update canvas from PIL
+                canvas = np.array(Image.fromarray(canvas))
+                placed_positions.append((cx, cy))
+    
+    # Save to buffer
     output = io.BytesIO()
-    pil_canvas.save(output, format='PNG', dpi=(300, 300))
+    Image.fromarray(canvas).save(output, format='PNG', dpi=(300, 300))
     output.seek(0)
     return output
-def create_palette_image(palette: List[Tuple[int, int, int]]) -> Image.Image:
-    """Палитра"""
+
+
+def create_palette_image(palette: List[Tuple[int, int, int]], config: PBNConfig) -> Image.Image:
+    """Generate palette reference image"""
     n_colors = len(palette)
-    palette_width = 300
-    palette_height = 70 + n_colors * 35
+    palette_width = 320
+    palette_height = 80 + n_colors * 40
     
     palette_img = Image.new('RGB', (palette_width, palette_height), 'white')
-    palette_draw = ImageDraw.Draw(palette_img)
+    draw = ImageDraw.Draw(palette_img)
     
-    try:
-        font = ImageFont.truetype("Arial.ttf", 12)
-        title_font = ImageFont.truetype("Arial.ttf", 15)
-    except:
-        font = ImageFont.load_default()
-        title_font = font
+    font = get_font(13)
+    title_font = get_font(16)
     
-    palette_draw.text((10, 12), "🎨 ПАЛИТРА ЦВЕТОВ", fill='black', font=title_font)
-    palette_draw.text((10, 33), f"Всего цветов: {n_colors}", fill='gray', font=font)
+    # Header
+    draw.text((15, 15), "🎨 ПАЛИТРА ЦВЕТОВ", fill='black', font=title_font)
+    draw.text((15, 38), f"Цветов: {n_colors} | Размер: {config.max_image_size}px", 
+             fill='gray', font=font)
     
+    # Color swatches
     for idx, color in enumerate(palette, start=1):
-        y_pos = 55 + (idx - 1) * 35
+        y_pos = 65 + (idx - 1) * 40
         
-        palette_draw.rectangle(
-            [(12, y_pos), (40, y_pos + 26)],
-            fill=color,
-            outline=(180, 180, 180),
-            width=1
-        )
-        palette_draw.text((50, y_pos + 4), f"{idx}.", fill='black', font=font)
-        hex_color = f'#{color[0]:02x}{color[1]:02x}{color[2]:02x}'
-        palette_draw.text((90, y_pos + 4), hex_color, fill='gray', font=font)
+        # Color box with border
+        draw.rectangle([(15, y_pos), (48, y_pos + 30)], fill=color, outline=(200, 200, 200), width=2)
+        
+        # Number
+        draw.text((58, y_pos + 6), f"{idx}.", fill='black', font=font)
+        
+        # HEX code
+        hex_color = f'#{color[0]:02x}{color[1]:02x}{color[2]:02x}'.upper()
+        draw.text((95, y_pos + 6), hex_color, fill=(100, 100, 100), font=font)
+        
+        # RGB values
+        rgb_text = f"RGB({color[0]}, {color[1]}, {color[2]})"
+        draw.text((95, y_pos + 22), rgb_text, fill=(150, 150, 150), font=get_font(10))
     
     return palette_img
 
-def process_image_for_coloring(photo_bytes: bytes, n_colors: int, min_region_size: int,
-                               line_thickness: int, line_color: str, font_size: int,
-                               max_image_size: int, preprocess_strength: str) -> Tuple[io.BytesIO, io.BytesIO]:
-    """Основная функция обработки"""
+
+# ============================================
+# MAIN PROCESSING PIPELINE
+# ============================================
+
+def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[io.BytesIO, io.BytesIO, Optional[str]]:
+    """
+    Full processing pipeline.
+    Returns: (coloring_page_buffer, palette_buffer, svg_string_or_none)
+    """
+    # Load and preprocess
     image = Image.open(io.BytesIO(photo_bytes))
-    img_array = preprocess_image(image, max_image_size, preprocess_strength)
+    img_array = preprocess_image(image, config.max_image_size, config.preprocess_strength)
     
-    quantized, labels, palette = cluster_colors_rgb(img_array, n_colors)
-    quantized = merge_with_morphology(quantized, palette, min_region_size)
+    # Color clustering
+    quantized, labels, palette = cluster_colors(img_array, config)
     
-    coloring_buffer = create_coloring_page_vector(
-        quantized, palette, min_region_size, line_thickness, line_color, font_size
-    )
+    # Merge small regions
+    quantized, labels = merge_small_regions(quantized, labels, palette, config.min_region_size)
+    
+    # Generate outputs
+    coloring_buffer = create_coloring_page_raster(quantized, palette, config)
     
     palette_buffer = io.BytesIO()
-    palette_img = create_palette_image(palette)
+    palette_img = create_palette_image(palette, config)
     palette_img.save(palette_buffer, format='PNG', dpi=(300, 300))
     palette_buffer.seek(0)
     
-    return coloring_buffer, palette_buffer
+    # Optional SVG
+    svg_output = None
+    if config.export_svg:
+        try:
+            svg_output = generate_svg_output(quantized, palette, config)
+        except Exception as e:
+            logger.warning(f"SVG generation failed: {e}, falling back to PNG only")
+    
+    return coloring_buffer, palette_buffer, svg_output
+
 
 # ============================================
-# ФУНКЦИИ БОТА
+# TELEGRAM BOT HANDLERS
 # ============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Welcome message with command overview"""
     await update.message.reply_text(
-        '🎨 <b>Бот "Раскраска по номерам" (v2.1 Professional)</b>\n\n'
-        'Отправьте фото — получите раскраску!\n\n'
-        '<b>Основные команды:</b>\n'
+        '🎨 <b>Paint by Numbers Bot v3.0 Professional</b>\n\n'
+        'Отправьте фото — получите профессиональную раскраску!\n\n'
+        '<b>🎛️ Быстрые настройки:</b>\n'
         '• <code>/colors 24</code> — количество цветов (3-48)\n'
-        '• <code>/detail 150</code> — мин. размер области (50-500)\n\n'
-        '<b>Тонкая настройка:</b>\n'
-        '• <code>/line 1</code> — толщина линий (1-3)\n'
-        '• <code>/linecolor gray</code> — цвет линий (gray/dark/light)\n'
-        '• <code>/font 11</code> — размер шрифта (9-14)\n'
-        '• <code>/size 1500</code> — макс. размер изображения (800-3000)\n'
-        '• <code>/smooth medium</code> — сглаживание (light/medium/strong)\n'
-        '• <code>/settings</code> — показать текущие настройки\n'
-        '• <code>/help</code> — подробная справка\n'
-        '• <code>/myid</code> — узнать свой ID (для админа)\n'
-        '• <code>/update</code> — перезапустить бота (только для админа)',
+        '• <code>/detail 150</code> — мин. размер области (50-500)\n'
+        '• <code>/smooth medium</code> — сглаживание (light/medium/strong)\n\n'
+        '<b>⚙️ Продвинутые:</b>\n'
+        '• <code>/space 0.1</code> — вес координат (0-0.5)\n'
+        '• <code>/colorspace lab</code> — LAB или RGB\n'
+        '• <code>/svg on</code> — включить SVG экспорт\n'
+        '• <code>/settings</code> — показать все настройки\n'
+        '• <code>/help</code> — полная справка',
         parse_mode='HTML'
     )
 
+
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings_text = (
+    """Display current user configuration"""
+    cfg = PBNConfig.from_user_data(context.user_data)
+    
+    settings = (
         '⚙️ <b>Текущие настройки:</b>\n\n'
-        f'🎨 Цветов: {context.user_data.get("n_colors", DEFAULT_N_COLORS)}\n'
-        f'📏 Мин. область: {context.user_data.get("min_region_size", DEFAULT_MIN_REGION_SIZE)}px\n'
-        f'📝 Толщина линий: {context.user_data.get("line_thickness", DEFAULT_LINE_THICKNESS)}\n'
-        f'🎨 Цвет линий: {context.user_data.get("line_color", DEFAULT_LINE_COLOR)}\n'
-        f'🔤 Размер шрифта: {context.user_data.get("font_size", DEFAULT_FONT_SIZE)}\n'
-        f'🖼️ Макс. размер: {context.user_data.get("max_image_size", DEFAULT_MAX_IMAGE_SIZE)}px\n'
-        f'🌊 Сглаживание: {context.user_data.get("preprocess_strength", DEFAULT_PREPROCESS_STRENGTH)}'
+        f'🎨 Цветов: {cfg.n_colors}\n'
+        f'📏 Мин. область: {cfg.min_region_size}px\n'
+        f'📝 Линии: {cfg.line_thickness}px ({cfg.line_color})\n'
+        f'🔤 Шрифт: {cfg.font_size}pt\n'
+        f'🖼️ Макс. размер: {cfg.max_image_size}px\n'
+        f'🌊 Сглаживание: {cfg.preprocess_strength}\n'
+        f'🎨 Пространство: {cfg.color_space.upper()}\n'
+        f'📍 Вес координат: {cfg.spatial_weight}\n'
+        f'📄 SVG экспорт: {"✅ Вкл" if cfg.export_svg else "❌ Выкл"}\n'
+        f'⚡ MiniBatch: {"✅ Вкл" if cfg.use_minibatch else "❌ Выкл"}'
     )
-    await update.message.reply_text(settings_text, parse_mode='HTML')
+    await update.message.reply_text(settings, parse_mode='HTML')
 
-async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ Используйте: <code>/colors 24</code> (3-48)', parse_mode='HTML')
-        return
-    n_colors = int(context.args[0])
-    if not 3 <= n_colors <= 48:
-        await update.message.reply_text('❌ Допустимый диапазон: 3-48 цветов', parse_mode='HTML')
-        return
-    context.user_data['n_colors'] = n_colors
-    await update.message.reply_text(f'✅ Установлено {n_colors} цветов')
 
-async def set_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ Используйте: <code>/detail 150</code> (50-500)', parse_mode='HTML')
-        return
-    min_size = int(context.args[0])
-    if not 50 <= min_size <= 500:
-        await update.message.reply_text('❌ Допустимый диапазон: 50-500 px', parse_mode='HTML')
-        return
-    context.user_data['min_region_size'] = min_size
-    await update.message.reply_text(f'✅ Мин. область: {min_size}px')
+# Generic setter factory
+def make_setter(param_name: str, param_type: type, min_val: Union[int, float], 
+                max_val: Union[int, float], success_msg: str, 
+                valid_values: Optional[List[str]] = None):
+    """Factory for creating parameter setter handlers"""
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await update.message.reply_text(
+                f'❌ Используйте: <code>/{param_name} {min_val}</code>', 
+                parse_mode='HTML'
+            )
+            return
+        
+        arg = context.args[0].lower()
+        
+        # Handle string enums
+        if valid_values:
+            if arg not in valid_values:
+                await update.message.reply_text(
+                    f'❌ Допустимые значения: {", ".join(valid_values)}', 
+                    parse_mode='HTML'
+                )
+                return
+            value = arg
+        else:
+            # Handle numeric
+            try:
+                value = param_type(arg)
+                if not (min_val <= value <= max_val):
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text(
+                    f'❌ Число от {min_val} до {max_val}', 
+                    parse_mode='HTML'
+                )
+                return
+        
+        context.user_data[param_name] = value
+        await update.message.reply_text(f'✅ {success_msg.format(value)}', parse_mode='HTML')
+    
+    return handler
 
-async def set_line_thickness(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ Используйте: <code>/line 1</code> (1-3)', parse_mode='HTML')
-        return
-    thickness = int(context.args[0])
-    if not 1 <= thickness <= 3:
-        await update.message.reply_text('❌ Допустимый диапазон: 1-3', parse_mode='HTML')
-        return
-    context.user_data['line_thickness'] = thickness
-    names = {1: 'тонкие', 2: 'средние', 3: 'толстые'}
-    await update.message.reply_text(f'✅ Толщина линий: {names[thickness]}')
 
-async def set_line_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or context.args[0].lower() not in ['gray', 'dark', 'light']:
-        await update.message.reply_text('❌ Используйте: <code>/linecolor gray</code>', parse_mode='HTML')
-        return
-    color = context.args[0].lower()
-    context.user_data['line_color'] = color
-    names = {'gray': 'серые', 'dark': 'тёмные', 'light': 'светлые'}
-    await update.message.reply_text(f'✅ Цвет линий: {names[color]}')
+# Create all setter handlers
+set_colors = make_setter('n_colors', int, 3, 48, 'Установлено {} цветов')
+set_detail = make_setter('min_region_size', int, 50, 500, 'Мин. область: {}px')
+set_line = make_setter('line_thickness', int, 1, 3, 'Толщина линий: {}')
+set_linecolor = make_setter('line_color', str, '', '', 'Цвет линий: {}', 
+                          valid_values=list(LINE_COLORS.keys()))
+set_font = make_setter('font_size', int, 9, 18, 'Размер шрифта: {}pt')
+set_size = make_setter('max_image_size', int, 800, 4000, 'Макс. размер: {}px')
+set_smooth = make_setter('preprocess_strength', str, '', '', 'Сглаживание: {}', 
+                        valid_values=['light', 'medium', 'strong'])
+set_space = make_setter('spatial_weight', float, 0, 0.5, 'Вес координат: {}')
+set_colorspace = make_setter('color_space', str, '', '', 'Цветовое пространство: {}', 
+                            valid_values=['rgb', 'lab'])
 
-async def set_font_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ Используйте: <code>/font 11</code> (9-14)', parse_mode='HTML')
+async def set_svg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle SVG export"""
+    if not context.args or context.args[0].lower() not in ['on', 'off', 'true', 'false', '1', '0']:
+        await update.message.reply_text('❌ Используйте: <code>/svg on</code> или <code>/svg off</code>', parse_mode='HTML')
         return
-    size = int(context.args[0])
-    if not 9 <= size <= 14:
-        await update.message.reply_text('❌ Допустимый диапазон: 9-14', parse_mode='HTML')
-        return
-    context.user_data['font_size'] = size
-    await update.message.reply_text(f'✅ Размер шрифта: {size}')
+    value = context.args[0].lower() in ['on', 'true', '1']
+    context.user_data['export_svg'] = value
+    await update.message.reply_text(f'✅ SVG экспорт: {"включён" if value else "выключен"}', parse_mode='HTML')
 
-async def set_max_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ Используйте: <code>/size 1500</code> (800-3000)', parse_mode='HTML')
+async def set_minibatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle MiniBatchKMeans optimization"""
+    if not context.args or context.args[0].lower() not in ['on', 'off', 'true', 'false', '1', '0']:
+        await update.message.reply_text('❌ Используйте: <code>/minibatch on</code> или <code>/minibatch off</code>', parse_mode='HTML')
         return
-    size = int(context.args[0])
-    if not 800 <= size <= 3000:
-        await update.message.reply_text('❌ Допустимый диапазон: 800-3000', parse_mode='HTML')
-        return
-    context.user_data['max_image_size'] = size
-    await update.message.reply_text(f'✅ Макс. размер: {size}px')
+    value = context.args[0].lower() in ['on', 'true', '1']
+    context.user_data['use_minibatch'] = value
+    await update.message.reply_text(f'✅ MiniBatch оптимизация: {"включена" if value else "выключена"}', parse_mode='HTML')
 
-async def set_smooth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or context.args[0].lower() not in ['light', 'medium', 'strong']:
-        await update.message.reply_text('❌ Используйте: <code>/smooth medium</code>', parse_mode='HTML')
-        return
-    strength = context.args[0].lower()
-    context.user_data['preprocess_strength'] = strength
-    names = {'light': 'слабое', 'medium': 'среднее', 'strong': 'сильное'}
-    await update.message.reply_text(f'✅ Сглаживание: {names[strength]}')
-
-# ============================================
-# НОВЫЕ КОМАНДЫ
-# ============================================
-
-# ВАЖНО: Замените 1234567890 на ваш реальный Telegram ID
-# Чтобы узнать свой ID, отправьте боту /myid
-ADMIN_ID = 931848809  # <--- ЗАМЕНИТЕ НА ВАШ ID
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user ID for admin verification"""
     user_id = update.effective_user.id
-    await update.message.reply_text(f'🆔 Ваш Telegram ID: <code>{user_id}</code>', parse_mode='HTML')
+    is_admin = "✅ Вы админ!" if user_id == ADMIN_ID else "❌ Не админ"
+    await update.message.reply_text(
+        f'🆔 Ваш ID: <code>{user_id}</code>\n{is_admin}', 
+        parse_mode='HTML'
+    )
+
 
 async def update_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text('❌ У вас нет прав для этой команды.')
+    """Admin-only bot update trigger"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text('❌ Только для администратора')
         return
     
-    await update.message.reply_text('🚀 Запускаю обновление стека...')
+    status_msg = await update.message.reply_text('🔄 Запрос обновления...')
+    
     if trigger_self_update():
-        await update.message.reply_text('✅ Portainer принял запрос. Контейнер будет перезапущен.')
+        await status_msg.edit_text('✅ Запрос принят. Бот перезагрузится через ~30 сек.')
     else:
-        await update.message.reply_text('❌ Ошибка при отправке запроса в Portainer.')
+        await status_msg.edit_text('❌ Ошибка обновления. Проверьте логи.')
 
-# ============================================
-# ОБРАБОТКА ФОТО
-# ============================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detailed help message"""
+    await update.message.reply_text(
+        '📖 <b>Полная справка v3.0</b>\n\n'
+        '<b>🎨 Основные параметры:</b>\n'
+        '<code>/colors N</code> — 3-48 цветов (по умолч. 24)\n'
+        '<code>/detail N</code> — мин. область 50-500px (по умолч. 150)\n'
+        '<code>/smooth X</code> — сглаживание: light/medium/strong\n\n'
+        '<b>📐 Визуальные настройки:</b>\n'
+        '<code>/line N</code> — толщина контура 1-3px\n'
+        '<code>/linecolor X</code> — gray/dark/light/black\n'
+        '<code>/font N</code> — размер номера 9-18pt\n'
+        '<code>/size N</code> — макс. размер 800-4000px\n\n'
+        '<b>⚙️ Продвинутые:</b>\n'
+        '<code>/colorspace lab</code> — LAB (качество) или RGB (скорость)\n'
+        '<code>/space 0.1</code> — вес координат 0-0.5 (выше = компактнее области)\n'
+        '<code>/svg on</code> — экспорт в векторный SVG\n'
+        '<code>/minibatch off</code> — отключить оптимизацию для малых изображений\n\n'
+        '<b>🔧 Системные:</b>\n'
+        '<code>/settings</code> — показать текущие настройки\n'
+        '<code>/myid</code> — узнать ID для админ-доступа',
+        parse_mode='HTML'
+    )
+
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Main image processing handler"""
     message = update.message
     photo = message.photo[-1]
     
-    n_colors = context.user_data.get('n_colors', DEFAULT_N_COLORS)
-    min_region_size = context.user_data.get('min_region_size', DEFAULT_MIN_REGION_SIZE)
-    line_thickness = context.user_data.get('line_thickness', DEFAULT_LINE_THICKNESS)
-    line_color = context.user_data.get('line_color', DEFAULT_LINE_COLOR)
-    font_size = context.user_data.get('font_size', DEFAULT_FONT_SIZE)
-    max_image_size = context.user_data.get('max_image_size', DEFAULT_MAX_IMAGE_SIZE)
-    preprocess_strength = context.user_data.get('preprocess_strength', DEFAULT_PREPROCESS_STRENGTH)
+    # Get config with defaults
+    cfg = PBNConfig.from_user_data(context.user_data)
     
-    settings_text = (
-        f'🎨 Цветов: {n_colors} | 📏 Мин: {min_region_size}px\n'
-        f'📝 Линии: {line_thickness} | 🎨 Цвет: {line_color}\n'
-        f'🔤 Шрифт: {font_size} | 🌊 Сглаж: {preprocess_strength}'
+    # Status message with settings summary
+    status_text = (
+        f'🎨 Обработка...\n'
+        f'🎨 {cfg.n_colors} цветов | 📏 мин. {cfg.min_region_size}px\n'
+        f'🎨 {cfg.color_space.upper()} | ⚡ {"MB" if cfg.use_minibatch else "Full"}'
     )
-    
-    status_msg = await message.reply_text(f'🎨 Создаю раскраску...\n\n{settings_text}')
+    status_msg = await message.reply_text(status_text)
     
     try:
+        # Download image
         file = await photo.get_file()
         photo_bytes = await file.download_as_bytearray()
         
-        coloring_buffer, palette_buffer = await asyncio.to_thread(
-            process_image_for_coloring, bytes(photo_bytes), n_colors, min_region_size,
-            line_thickness, line_color, font_size, max_image_size, preprocess_strength
+        # Process in thread pool (CPU-bound)
+        coloring_buf, palette_buf, svg_output = await asyncio.to_thread(
+            process_image_for_coloring, bytes(photo_bytes), cfg
         )
         
-        await message.reply_document(
-            document=coloring_buffer,
-            filename='coloring_page.svg',
-            caption=f'🖼️ Раскраска (SVG)\n{settings_text}'
-        )
-        await message.reply_photo(palette_buffer, caption='🎨 Палитра')
+        # Send coloring page
+        filename = 'coloring_page.svg' if (svg_output and cfg.export_svg) else 'coloring_page.png'
+        content_type = 'image/svg+xml' if filename.endswith('.svg') else 'image/png'
         
+        if svg_output and cfg.export_svg:
+            # Send SVG as document
+            svg_buf = io.BytesIO(svg_output.encode('utf-8'))
+            await message.reply_document(
+                document=svg_buf,
+                filename=filename,
+                caption=f'🖼️ Раскраска (SVG)\n{status_text}',
+                disable_content_type_detection=True
+            )
+        else:
+            # Send PNG
+            await message.reply_document(
+                document=coloring_buf,
+                filename='coloring_page.png',
+                caption=f'🖼️ Раскраска (PNG)\n{status_text}'
+            )
+        
+        # Send palette
+        await message.reply_photo(palette_buf, caption='🎨 Палитра цветов')
+        
+        # Tip for small regions
+        if cfg.min_region_size < 100:
+            await message.reply_text(
+                '💡 <i>Совет:</i> Маленькие области (<100px) могут быть сложны для раскрашивания. '
+                'Используйте <code>/detail 150</code> для более крупных зон.',
+                parse_mode='HTML'
+            )
+            
+    except MemoryError:
+        logger.error("Out of memory during processing")
+        await message.reply_text(
+            '❌ <b>Недостаточно памяти</b>\nПопробуйте уменьшить <code>/size 800</code> или <code>/detail 200</code>',
+            parse_mode='HTML'
+        )
+    except cv2.error as e:
+        logger.error(f"OpenCV error: {e}")
+        await message.reply_text('❌ Ошибка обработки изображения. Попробуйте другое фото.')
+    except asyncio.TimeoutError:
+        logger.error("Processing timeout")
+        await message.reply_text('⏱️ Таймаут. Попробуйте уменьшить сложность (/detail ↑, /size ↓)')
     except Exception as e:
-        logger.error(f'Ошибка: {e}', exc_info=True)
-        await message.reply_text('❌ Ошибка обработки. Попробуйте другие настройки.')
+        logger.exception(f"Unexpected error: {type(e).__name__}: {e}")
+        await message.reply_text('❌ Внутренняя ошибка. Попробуйте позже или измените настройки.')
     finally:
         await status_msg.delete()
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        '📖 <b>Полная справка (v2.1)</b>\n\n'
-        '<b>Основные команды:</b>\n'
-        '• <code>/colors N</code> — цветов (3-48, по умолч. 24)\n'
-        '• <code>/detail N</code> — мин. область (50-500, по умолч. 150)\n\n'
-        '<b>Тонкая настройка:</b>\n'
-        '• <code>/line N</code> — толщина линий (1-3, по умолч. 1)\n'
-        '• <code>/linecolor X</code> — цвет линий (gray/dark/light)\n'
-        '• <code>/font N</code> — размер шрифта (9-14, по умолч. 11)\n'
-        '• <code>/size N</code> — макс. размер (800-3000, по умолч. 1500)\n'
-        '• <code>/smooth X</code> — сглаживание (light/medium/strong)\n'
-        '• <code>/settings</code> — показать настройки\n'
-        '• <code>/myid</code> — узнать свой ID (для админа)\n'
-        '• <code>/update</code> — перезапустить бота (только для админа)',
-        parse_mode='HTML'
-    )
 
 # ============================================
-# MAIN
+# APPLICATION SETUP
 # ============================================
+
+def create_application() -> Application:
+    """Factory for bot application with all handlers"""
+    app = Application.builder().token(TOKEN).build()
+    
+    # Core commands
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('help', help_command))
+    app.add_handler(CommandHandler('settings', show_settings))
+    
+    # Parameter setters
+    app.add_handler(CommandHandler('colors', set_colors))
+    app.add_handler(CommandHandler('detail', set_detail))
+    app.add_handler(CommandHandler('line', set_line))
+    app.add_handler(CommandHandler('linecolor', set_linecolor))
+    app.add_handler(CommandHandler('font', set_font))
+    app.add_handler(CommandHandler('size', set_size))
+    app.add_handler(CommandHandler('smooth', set_smooth))
+    
+    # Advanced parameters
+    app.add_handler(CommandHandler('space', set_space))
+    app.add_handler(CommandHandler('colorspace', set_colorspace))
+    app.add_handler(CommandHandler('svg', set_svg))
+    app.add_handler(CommandHandler('minibatch', set_minibatch))
+    
+    # System commands
+    app.add_handler(CommandHandler('myid', myid))
+    app.add_handler(CommandHandler('update', update_bot))
+    
+    # Image handler (must be last to not intercept commands)
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
+    
+    return app
+
 
 def main() -> None:
-    application = Application.builder().token(TOKEN).build()
+    """Entry point"""
+    logger.info("🎨 PBN Bot v3.0 Professional starting...")
+    logger.info(f"Config: color_space={DEFAULT_CONFIG['color_space']}, "
+               f"admin_id={ADMIN_ID}, svg_export={DEFAULT_CONFIG['export_svg']}")
     
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('settings', show_settings))
-    application.add_handler(CommandHandler('colors', set_colors))
-    application.add_handler(CommandHandler('detail', set_detail))
-    application.add_handler(CommandHandler('line', set_line_thickness))
-    application.add_handler(CommandHandler('linecolor', set_line_color))
-    application.add_handler(CommandHandler('font', set_font_size))
-    application.add_handler(CommandHandler('size', set_max_size))
-    application.add_handler(CommandHandler('smooth', set_smooth))
-    application.add_handler(CommandHandler('myid', myid))
-    application.add_handler(CommandHandler('update', update_bot))
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
+    application = create_application()
     
-    logger.info('🎨 Бот запущен (v2.1 Professional)!')
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        logger.info("🚀 Polling started...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except KeyboardInterrupt:
+        logger.info("👋 Shutdown requested")
+    except Exception as e:
+        logger.critical(f"💥 Fatal error: {e}", exc_info=True)
+        raise
+
 
 if __name__ == '__main__':
     main()
