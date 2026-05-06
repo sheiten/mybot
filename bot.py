@@ -599,12 +599,12 @@ def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[i
     labels = kmeans.fit_predict(pixels)
     centers = kmeans.cluster_centers_.astype(np.uint8)
 
-    # Сортировка палитры по яркости для красивого вывода
+    # Сортировка палитры по яркости
     brightness = np.dot(centers, [0.299, 0.587, 0.114])
     sorted_indices = np.argsort(brightness)
     palette = [tuple(centers[i]) for i in sorted_indices]
     
-    # Пересоздаём quantized image с отсортированной палитрой
+    # Пересоздаём quantized image
     quantized_flat = np.zeros_like(pixels)
     for new_idx, old_idx in enumerate(sorted_indices):
         quantized_flat[labels == old_idx] = centers[old_idx]
@@ -618,27 +618,29 @@ def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[i
     logger.info(f"3. Слияние регионов меньше {config.min_region_size} пикселей...")
     label_map = np.zeros((h, w), dtype=np.int32)
     
-    # Сначала создадим начальную карту регионов
+    # Начальная карта регионов
     for idx, color in enumerate(palette):
         mask = np.all(quantized == color, axis=2)
         label_map[mask] = idx + 1
 
-    # Теперь для каждого цвета находим регионы и сливаем маленькие
+    # Слияние маленьких регионов
     final_label_map = np.zeros((h, w), dtype=np.int32)
     current_label = 1
     region_id_to_color = {}
+    final_palette = []
 
     for color_idx, color in enumerate(palette):
         mask = np.uint8(label_map == (color_idx + 1)) * 255
         num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         
-        # Проходим по каждому региону этого цвета
         for comp_id in range(1, num_labels):
             area = stats[comp_id, cv2.CC_STAT_AREA]
             if area >= config.min_region_size:
-                # Достаточно большой — оставляем как есть
+                # Достаточно большой — оставляем
                 final_label_map[labels_im == comp_id] = current_label
                 region_id_to_color[current_label] = color
+                if color not in final_palette:
+                    final_palette.append(color)
                 current_label += 1
             else:
                 # Слишком маленький — ищем самого большого соседа
@@ -646,11 +648,10 @@ def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[i
                 dilated = cv2.dilate(component_mask, np.ones((3,3), np.uint8)) 
                 boundary = dilated - component_mask
                 
-                # Смотрим, какие регионы (не этого цвета) граничат
                 neighbor_labels = final_label_map[boundary > 0]
                 if len(neighbor_labels) == 0: continue
                 
-                # Считаем, какой сосед имеет наибольшую площадь
+                # Ищем соседа с наибольшей площадью
                 best_neighbor = 0
                 max_area = 0
                 for nl in np.unique(neighbor_labels):
@@ -664,55 +665,86 @@ def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[i
                 if best_neighbor > 0:
                     target_color = region_id_to_color[best_neighbor]
                     final_label_map[labels_im == comp_id] = best_neighbor
-                    # Обновляем квантованное изображение
                     quantized[labels_im == comp_id] = target_color
+
+    # Приводим палитру в порядок (по яркости)
+    final_palette.sort(key=lambda c: 0.299*c[0] + 0.587*c[1] + 0.114*c[2])
 
     # 4. Генерация финальной раскраски
     logger.info("4. Создание раскраски и расстановка номеров...")
+    # Создаём белый холст
     canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
     line_rgb = config.line_rgb
-    
-    # Рисуем границы
-    grad_x = np.abs(np.diff(final_label_map, axis=1, prepend=final_label_map[:, :1]))
-    grad_y = np.abs(np.diff(final_label_map, axis=0, prepend=final_label_map[:1, :]))
-    boundary_mask = ((grad_x > 0) | (grad_y > 0)).astype(np.uint8)
-    boundary_mask = cv2.dilate(boundary_mask, np.ones((3,3)), iterations=config.line_thickness)
-    canvas[boundary_mask > 0] = line_rgb
-    
-    # Расставляем номера в центроидах
-    final_palette = []
-    placed_positions = []
     font = get_font(config.font_size)
     
-    # Пересоздаём палитру для оставшихся цветов
-    remaining_labels = np.unique(final_label_map)
-    remaining_labels = remaining_labels[remaining_labels != 0]
+    # 4.1 СНАЧАЛА расставляем номера (на чистом холсте)
+    # Создадим копию final_label_map для работы
+    labels_for_centroids = final_label_map.copy()
     
-    for label in remaining_labels:
-        color = region_id_to_color[label]
-        if color not in final_palette:
-            final_palette.append(color)
+    # Маска уже размещённых номеров, чтобы не накладывать
+    placed_mask = np.zeros((h, w), dtype=np.uint8)
     
-    for label in remaining_labels:
-        mask = np.uint8(final_label_map == label)
-        num, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    for label in np.unique(labels_for_centroids):
+        if label == 0: continue
         
-        # Для больших регионов может быть несколько компонент связности, но мы возьмём первую
-        if num > 1 and stats[1, cv2.CC_STAT_AREA] > 100:
+        mask = np.uint8(labels_for_centroids == label)
+        num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        
+        if num_labels > 1 and stats[1, cv2.CC_STAT_AREA] > 100:
+            # Берем центроид первого компонента
             cx, cy = int(centroids[1][0]), int(centroids[1][1])
             color = region_id_to_color[label]
-            color_idx = final_palette.index(color) + 1
             
+            if color in final_palette:
+                color_idx = final_palette.index(color) + 1
+            else:
+                continue
+                
             if 0 <= cx < w and 0 <= cy < h:
                 num_str = str(color_idx)
                 pil_img = Image.fromarray(canvas)
                 draw = ImageDraw.Draw(pil_img)
                 
-                text_w, text_h = draw.textbbox((0, 0), num_str, font=font)[2:]
-                draw.rectangle([cx - text_w//2 - 2, cy - text_h//2 - 2, 
-                                cx + text_w//2 + 2, cy + text_h//2 + 2], fill=(255, 255, 255))
+                # Используем textbbox для точного размера текста (Pillow >= 8.0.0)
+                try:
+                    text_bbox = draw.textbbox((0, 0), num_str, font=font)
+                    text_w = text_bbox[2] - text_bbox[0]
+                    text_h = text_bbox[3] - text_bbox[1]
+                except AttributeError:
+                    text_w, text_h = draw.textsize(num_str, font=font)
+                
+                padding = 3
+                rect_x1 = cx - text_w//2 - padding
+                rect_y1 = cy - text_h//2 - padding
+                rect_x2 = cx + text_w//2 + padding
+                rect_y2 = cy + text_h//2 + padding
+                
+                # Проверяем, не наедет ли на уже поставленный номер
+                if np.any(placed_mask[rect_y1:rect_y2, rect_x1:rect_x2]):
+                    continue
+                
+                # Рисуем белый прямоугольник и текст
+                draw.rectangle([rect_x1, rect_y1, rect_x2, rect_y2], fill=(255, 255, 255))
                 draw.text((cx - text_w//2, cy - text_h//2), num_str, fill='black', font=font)
                 canvas = np.array(pil_img)
+                
+                # Помечаем, что здесь уже есть номер
+                cv2.rectangle(placed_mask, (rect_x1, rect_y1), (rect_x2, rect_y2), 1, thickness=-1)
+
+    # 4.2 ТЕПЕРЬ рисуем контуры поверх номеров
+    # Используем findContours на всей карте регионов
+    # Преобразуем final_label_map в uint8 для поиска контуров
+    contour_mask = np.zeros((h, w), dtype=np.uint8)
+    # Там где есть переход между разными label, ставим 255
+    for label in np.unique(final_label_map):
+        if label == 0: continue
+        single_region = np.uint8(final_label_map == label) * 255
+        contours, _ = cv2.findContours(single_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Рисуем контуры каждого региона, но не закрашиваем
+        cv2.drawContours(contour_mask, contours, -1, color=255, thickness=config.line_thickness)
+    
+    # Накладываем контуры на canvas
+    canvas[contour_mask == 255] = line_rgb
 
     # 5. Подготовка результатов
     coloring_buffer = io.BytesIO()
@@ -724,9 +756,8 @@ def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[i
     palette_img.save(palette_buffer, format='PNG', dpi=(300, 300))
     palette_buffer.seek(0)
 
-    logger.info("Готово! Раскраска создана.")
+    logger.info("Готово! Раскраска создана с чёткими контурами.")
     return coloring_buffer, palette_buffer, None
-
 # ============================================
 # TELEGRAM BOT HANDLERS
 # ============================================
