@@ -569,7 +569,7 @@ def safe_text_size(text: str, font_obj) -> Tuple[int, int]:
         if hasattr(font_obj, 'getbbox'):
                 bbox = font_obj.getbbox(text)
                 return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
-            elif hasattr(font_obj, 'getsize'):
+        elif hasattr(font_obj, 'getsize'):
                 return font_obj.getsize(text)
         except: pass
         return max(1, font_size * len(text) // 2), max(1, font_size)
