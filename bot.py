@@ -2,265 +2,365 @@ import asyncio
 import logging
 import os
 import io
+from typing import List, Tuple
+import math
+from collections import deque
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from sklearn.cluster import KMeans
 import cv2
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-# Для работы SLIC обязательно наличие модуля ximgproc (есть в стандартном pip install opencv-contrib-python)
-try:
-    import cv2.ximgproc
-    SLIC_AVAILABLE = True
-except ImportError:
-    SLIC_AVAILABLE = False
 
 TOKEN = os.environ.get('BOT_TOKEN', '')
 if not TOKEN:
     raise ValueError('BOT_TOKEN environment variable is not set!')
 
-MAX_IMAGE_SIZE = 1000
-DEFAULT_REGION_SIZE = 1500 # Теперь это размер суперпикселей (площадь)
+DEFAULT_N_COLORS = 24
+MIN_REGION_SIZE = 150
+MAX_IMAGE_SIZE = 1500
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def process_image_for_coloring(photo_bytes: bytes, region_size: int = DEFAULT_REGION_SIZE):
-    """Гибридный алгоритм: Сетка SLIC + Фабричные линии"""
-    if not SLIC_AVAILABLE:
-        raise RuntimeError("Установите opencv-contrib-python: pip install opencv-contrib-python")
-
-    input_img = Image.open(io.BytesIO(photo_bytes)).convert('RGB')
-    w, h = input_img.size
+def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> np.ndarray:
+    """Предобработка изображения"""
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
     
-    if max(w, h) > MAX_IMAGE_SIZE:
-        ratio = MAX_IMAGE_SIZE / max(w, h)
-        input_img = input_img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
-        w, h = input_img.size
-
-    img_np = np.array(input_img)
-    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB) # SLIC лучше работает в пространстве LAB
-
-    # 1. Инициализация SLIC (секрет аккуратных ячеек)
-    # region_size регулирует размер "сот". Чем меньше число - тем мельче детали.
-    slic = cv2.ximgproc.createSuperpixelSLIC(img_cv, region_size=region_size, ruler=20.0)
-    slic.iterate(10) # 10 итераций достаточно для идеальной сходимости
-    slic.enforceLabelConnectivity() # Убирает оторванные куски (важно!)
-
-    labels = slic.getLabels() # Карта зон (каждый пиксель имеет номер зоны от 0 до N)
-    num_superpixels = slic.getNumberOfSuperpixels()
-
-    # 2. Собираем цвета зон и фильтруем мусор
-    mask = slic.getLabelContourMask(thick_line=True) # Маска контуров (толстые линии)
+    width, height = image.size
+    if max(width, height) > target_size:
+        ratio = target_size / max(width, height)
+        image = image.resize((int(width * ratio), int(height * ratio)), Image.Resampling.LANCZOS)
     
-    region_colors = {}
-    region_areas = {}
+    img_array = np.array(image)
+    
+    # Лёгкое сглаживание для уменьшения шума
+    img_array = cv2.bilateralFilter(img_array, 7, 50, 50)
+    
+    return img_array
+
+
+def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int, int, int]]]:
+    """Квантование цветов"""
+    h, w = img_array.shape[:2]
+    pixels = img_array.reshape((-1, 3))
+    
+    kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10, max_iter=300)
+    labels = kmeans.fit_predict(pixels)
+    centers = kmeans.cluster_centers_.astype(int)
+    
+    # Сортировка по яркости
+    brightness = 0.299 * centers[:, 0] + 0.587 * centers[:, 1] + 0.114 * centers[:, 2]
+    sorted_indices = np.argsort(brightness)
+    centers = centers[sorted_indices]
+    
+    # Переназначаем метки
+    label_map = {old: new for new, old in enumerate(sorted_indices)}
+    labels = np.array([label_map[l] for l in labels]).reshape((h, w))
+    
+    quantized = centers[labels]
+    
+    return quantized, labels, [tuple(c) for c in centers]
+
+
+def find_connected_regions(mask: np.ndarray, min_size: int = 100) -> List[Tuple[List[int], List[int], int, int]]:
+    """
+    Поиск связных областей через BFS (как в оригинальном IBNG)
+    Возвращает список регионов: (x_координаты, y_координаты, центр_x, центр_y)
+    """
+    h, w = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    regions = []
     
     for y in range(h):
         for x in range(w):
-            label = labels[y, x]
-            if label not in region_colors:
-                region_colors[label] = [0, 0, 0]
-                region_areas[label] = 0
-            
-            # Суммируем цвета в RGB (img_np в RGB)
-            region_colors[label][0] += img_np[y, x, 0]
-            region_colors[label][1] += img_np[y, x, 1]
-            region_colors[label][2] += img_np[y, x, 2]
-            region_areas[label] += 1
-
-    # Усредняем цвета и отбрасываем слишком мелкие зоны (шум)
-    valid_regions = {}
-    for label, color_sum in region_colors.items():
-        area = region_areas[label]
-        if area < 300: # Пропускаем микроскопический мусор
-            continue
-        valid_regions[label] = [c // area for c in color_sum]
-
-    # 3. Группировка похожих цветов (чтобы не было 500 разных номеров)
-    # Собираем уникальные средние цвета
-    unique_colors = list(valid_regions.values())
+            if mask[y, x] and not visited[y, x]:
+                # BFS
+                queue = deque([(x, y)])
+                region_x, region_y = [], []
+                
+                while queue:
+                    cx, cy = queue.popleft()
+                    if 0 <= cx < w and 0 <= cy < h and mask[cy, cx] and not visited[cy, cx]:
+                        visited[cy, cx] = True
+                        region_x.append(cx)
+                        region_y.append(cy)
+                        queue.extend([(cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)])
+                
+                if len(region_x) >= min_size:
+                    center_x = int(np.mean(region_x))
+                    center_y = int(np.mean(region_y))
+                    regions.append((region_x, region_y, center_x, center_y))
     
-    if len(unique_colors) > 48:
-        # Если зон слишком много, группируем их через KMeans ПАЛЕТРЫ
-        from sklearn.cluster import KMeans
-        kmeans = KMeans(n_clusters=48, n_init=10, random_state=42)
-        palette_labels = kmeans.fit_predict(unique_colors)
-        palette_centers = kmeans.cluster_centers_.astype("uint8")
-    else:
-        # Если зон мало, просто нумеруем их
-        palette_centers = np.array(unique_colors, dtype=np.uint8)
-        palette_labels = list(range(len(unique_colors)))
+    return regions
 
-    # Маппинг: оригинальная зона SLIC -> Номер цвета в палитре
-    label_to_color_num = {}
-    valid_idx = 0
-    for label in valid_regions.keys():
-        label_to_color_num[label] = palette_labels[valid_idx] + 1 # +1 чтобы было от 1 до 48
-        valid_idx += 1
 
-    # 4. Финальный рендеринг через PIL (для гладкости)
-    canvas = Image.new('RGB', (w, h), (255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
+def get_center_in_region(mask: np.ndarray) -> Tuple[int, int]:
+    """
+    Умный поиск центра области (адаптировано из IBNG)
+    """
+    ys, xs = np.where(mask)
+    if len(ys) == 0:
+        return 0, 0
+    
+    # Ищем центр по вертикали и горизонтали
+    center_x = int(np.mean(xs))
+    center_y = int(np.mean(ys))
+    
+    # Корректируем, чтобы центр был внутри
+    if not mask[center_y, center_x]:
+        # Ищем ближайшую точку внутри
+        distances = (xs - center_x) ** 2 + (ys - center_y) ** 2
+        idx = np.argmin(distances)
+        center_x, center_y = xs[idx], ys[idx]
+    
+    return center_x, center_y
 
+
+def create_coloring_page(img_array: np.ndarray, quantized: np.ndarray, labels: np.ndarray, 
+                        palette: List[Tuple[int, int, int]], min_region_size: int) -> Image.Image:
+    """
+    Создание раскраски по номерам (вдохновлено IBNG)
+    """
+    h, w = img_array.shape[:2]
+    
+    # Создаём холст
+    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
+    
+    # Сначала находим ВСЕ контуры
+    all_contours_mask = np.zeros((h, w), dtype=bool)
+    
+    for color_idx, color in enumerate(palette):
+        color_mask = np.all(quantized == color, axis=2)
+        
+        # Находим контуры через разницу (метод из IBNG)
+        padded = np.pad(color_mask, ((1, 1), (1, 1)), mode='constant')
+        contours = (
+            (padded[:-2, 1:-1] != padded[2:, 1:-1]) | 
+            (padded[1:-1, :-2] != padded[1:-1, 2:])
+        ) & color_mask
+        
+        all_contours_mask |= contours
+    
+    # Рисуем ВСЕ контуры серым цветом
+    canvas[all_contours_mask] = [180, 180, 180]
+    
+    # Теперь расставляем номера
+    pil_canvas = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(pil_canvas)
+    
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 16)
-        font_small = ImageFont.truetype("DejaVuSans.ttf", 11)
-    except IOError:
+        font = ImageFont.truetype("Arial.ttf", 11)
+    except:
         font = ImageFont.load_default()
-        font_small = font
-
-    # Вычисляем центры зон для цифр
-    region_centers = {}
-    for y in range(h):
-        for x in range(w):
-            label = labels[y, x]
-            if label not in valid_regions:
+    
+    placed_positions = []
+    
+    for color_idx, color in enumerate(palette):
+        color_mask = np.all(quantized == color, axis=2)
+        
+        # Находим связные регионы
+        regions = find_connected_regions(color_mask, min_region_size)
+        
+        for region_x, region_y, cx, cy in regions:
+            # Проверяем, не слишком ли близко к другим номерам
+            too_close = False
+            for px, py in placed_positions:
+                if math.sqrt((cx - px) ** 2 + (cy - py) ** 2) < 25:
+                    too_close = True
+                    break
+            
+            if too_close:
                 continue
-            if label not in region_centers:
-                region_centers[label] = [0, 0, 0]
-            region_centers[label][0] += x
-            region_centers[label][1] += y
-            region_centers[label][2] += 1
+            
+            # Проверяем, что центр внутри области
+            if not color_mask[cy, cx]:
+                # Создаём мини-маску и находим центр
+                mini_mask = np.zeros((h, w), dtype=bool)
+                for rx, ry in zip(region_x, region_y):
+                    mini_mask[ry, rx] = True
+                cx, cy = get_center_in_region(mini_mask)
+            
+            # Рисуем номер
+            num_str = str(color_idx + 1)
+            bbox = draw.textbbox((0, 0), num_str, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            
+            # Белый фон под номером
+            padding = 2
+            draw.rectangle(
+                [cx - text_w // 2 - padding, cy - text_h // 2 - padding,
+                 cx + text_w // 2 + padding, cy + text_h // 2 + padding],
+                fill='white',
+                outline=None
+            )
+            
+            # Рисуем номер
+            draw.text((cx - text_w // 2, cy - text_h // 2), num_str, fill=(0, 0, 0), font=font)
+            placed_positions.append((cx, cy))
+    
+    return pil_canvas
 
-    # Рисуем цифры
-    for label, center_data in region_centers.items():
-        area = region_areas[label]
-        cx = center_data[0] // area
-        cy = center_data[1] // area
-        
-        num = label_to_color_num[label]
-        label_str = str(num)
-        current_font = font if area > 2000 else font_small
-        
-        bbox = draw.textbbox((0, 0), label_str, font=current_font)
-        t_w = bbox[2] - bbox[0]
-        t_h = bbox[3] - bbox[1]
-        
-        draw.text((cx - t_w / 2, cy - t_h / 2 - 2), label_str, fill=(100, 100, 100), font=current_font)
 
-    # Накладываем ФАБРИЧНЫЕ КОНТУРЫ поверх всего
-    canvas_np = np.array(canvas)
-    # mask от SLIC: там где контур = 255 (белый). Инвертируем и красим в черный
-    canvas_np[mask == 255] = [0, 0, 0]
-
-    coloring_img = Image.fromarray(canvas_np)
-
-    # 5. Генерация палитры
-    palette = Image.new('RGB', (w, 80), (255, 255, 255))
-    draw_pal = ImageDraw.Draw(palette)
+def create_palette_image(palette: List[Tuple[int, int, int]]) -> Image.Image:
+    """Создание изображения палитры"""
+    n_colors = len(palette)
+    palette_width = 300
+    square_size = 30
+    palette_height = 70 + n_colors * 35
+    
+    palette_img = Image.new('RGB', (palette_width, palette_height), 'white')
+    palette_draw = ImageDraw.Draw(palette_img)
     
     try:
-        font_pal = ImageFont.truetype("DejaVuSans.ttf", 12)
-    except IOError:
-        font_pal = ImageFont.load_default()
-
-    swatch_w = w // len(palette_centers)
-    for i, color in enumerate(palette_centers):
-        x1, y1 = i * swatch_w + 4, 10
-        x2, y2 = (i + 1) * swatch_w - 4, 50
-        draw_pal.rectangle([x1, y1, x2, y2], fill=tuple(color.tolist()), outline=(180, 180, 180))
+        font = ImageFont.truetype("Arial.ttf", 12)
+        title_font = ImageFont.truetype("Arial.ttf", 15)
+    except:
+        font = ImageFont.load_default()
+        title_font = font
+    
+    palette_draw.text((10, 12), "🎨 ПАЛИТРА ЦВЕТОВ", fill='black', font=title_font)
+    palette_draw.text((10, 33), f"Всего цветов: {n_colors}", fill='gray', font=font)
+    
+    for idx, color in enumerate(palette, start=1):
+        y_pos = 55 + (idx - 1) * 35
         
-        label = str(i + 1)
-        bbox = draw_pal.textbbox((0, 0), label, font=font_pal)
-        t_w = bbox[2] - bbox[0]
-        draw_pal.text((i * swatch_w + swatch_w//2 - t_w//2, 58), label, fill=(0, 0, 0), font=font_pal)
+        palette_draw.rectangle(
+            [(12, y_pos), (40, y_pos + 26)],
+            fill=color,
+            outline=(180, 180, 180),
+            width=1
+        )
+        
+        palette_draw.text((50, y_pos + 4), f"{idx}.", fill='black', font=font)
+        
+        hex_color = f'#{color[0]:02x}{color[1]:02x}{color[2]:02x}'
+        palette_draw.text((90, y_pos + 4), hex_color, fill='gray', font=font)
+        
+        r = 7
+        palette_draw.ellipse(
+            [265 - r, y_pos + 13 - r, 265 + r, y_pos + 13 + r],
+            fill=color,
+            outline=(150, 150, 150),
+            width=1
+        )
+    
+    return palette_img
 
-    # Сохранение в память
+
+def process_image_for_coloring(photo_bytes: bytes, n_colors: int = DEFAULT_N_COLORS,
+                               min_region_size: int = MIN_REGION_SIZE) -> Tuple[io.BytesIO, io.BytesIO]:
+    """Основная функция обработки"""
+    image = Image.open(io.BytesIO(photo_bytes))
+    img_array = preprocess_image(image)
+    
+    quantized, labels, palette = cluster_colors(img_array, n_colors)
+    coloring_img = create_coloring_page(img_array, quantized, labels, palette, min_region_size)
+    palette_img = create_palette_image(palette)
+    
     coloring_buffer = io.BytesIO()
-    coloring_img.save(coloring_buffer, format='PNG')
+    coloring_img.save(coloring_buffer, format='PNG', dpi=(300, 300))
     coloring_buffer.seek(0)
     
     palette_buffer = io.BytesIO()
-    palette.save(palette_buffer, format='PNG')
+    palette_img.save(palette_buffer, format='PNG', dpi=(300, 300))
     palette_buffer.seek(0)
     
-    return coloring_buffer, palette_buffer, len(palette_centers)
+    return coloring_buffer, palette_buffer
 
 
-# --- Бот ---
-
+# Функции бота
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not SLIC_AVAILABLE:
-        await update.message.reply_text('❌ Ошибка: установите `opencv-contrib-python` на сервере.')
-        return
-        
     await update.message.reply_text(
-        '🎨 <b>Суперпиксельный Бот (SLIC)</b>\n\n'
-        'Теперь я использую алгоритм "пчелиных сот". Формы получаются аккуратными!\n\n'
-        '⚙️ <b>Настройки:</b>\n'
-        '• <code>/size 1500</code> — размер ячейки (500 = много мелких деталей, 3000 = крупные зоны)\n'
+        '🎨 <b>Бот "Раскраска по номерам"</b>\n\n'
+        'Отправьте фото — получите раскраску!\n\n'
+        '<b>Команды:</b>\n'
+        '• <code>/colors 24</code> — цветов (3-48)\n'
+        '• <code>/detail 150</code> — мин. область (50-500)\n'
         '• <code>/help</code> — справка',
         parse_mode='HTML'
     )
 
-async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ Укажите число: <code>/size 1500</code>', parse_mode='HTML')
+        await update.message.reply_text('❌ <code>/colors 24</code>', parse_mode='HTML')
         return
-    size = int(context.args[0])
-    if not 200 <= size <= 5000:
-        await update.message.reply_text('❌ Допустимо от 200 до 5000', parse_mode='HTML')
+    n_colors = int(context.args[0])
+    if not 3 <= n_colors <= 48:
+        await update.message.reply_text('❌ 3-48 цветов', parse_mode='HTML')
         return
-    context.user_data['region_size'] = size
-    await update.message.reply_text(f'✅ Размер сот: {size}')
+    context.user_data['n_colors'] = n_colors
+    await update.message.reply_text(f'✅ {n_colors} цветов')
+
+
+async def set_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text('❌ <code>/detail 150</code>', parse_mode='HTML')
+        return
+    min_size = int(context.args[0])
+    if not 50 <= min_size <= 500:
+        await update.message.reply_text('❌ 50-500', parse_mode='HTML')
+        return
+    context.user_data['min_size'] = min_size
+    await update.message.reply_text(f'✅ Мин. область: {min_size}px')
+
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     photo = message.photo[-1]
     
-    status_msg = await message.reply_text('🎨 Рисуем сетку суперпикселей...')
+    status_msg = await message.reply_text('🎨 Создаю раскраску...')
     
     try:
         file = await photo.get_file()
         photo_bytes = await file.download_as_bytearray()
         
-        region_size = context.user_data.get('region_size', DEFAULT_REGION_SIZE)
+        n_colors = context.user_data.get('n_colors', DEFAULT_N_COLORS)
+        min_size = context.user_data.get('min_size', MIN_REGION_SIZE)
         
-        coloring_buffer, palette_buffer, n_colors = await asyncio.to_thread(
-            process_image_for_coloring, bytes(photo_bytes), region_size
+        coloring_buffer, palette_buffer = await asyncio.to_thread(
+            process_image_for_coloring, bytes(photo_bytes), n_colors, min_size
         )
         
-        await message.reply_photo(
-            coloring_buffer,
-            caption=f'🖼️ SLIC-Раскраска!\n🎨 Уникальных цветов в палитре: {n_colors}'
-        )
+        await message.reply_photo(coloring_buffer, caption=f'🖼️ Раскраска!\n🎨 Цветов: {n_colors}')
         await message.reply_photo(palette_buffer, caption='🎨 Палитра')
         
     except Exception as e:
         logger.error(f'Ошибка: {e}', exc_info=True)
-        await message.reply_text(f'❌ Ошибка: {str(e)}')
+        await message.reply_text('❌ Ошибка обработки')
     finally:
         await status_msg.delete()
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        '📖 <b>Как работает SLIC:</b>\n\n'
-        'Он режет картинку на одинаковые "соты", а потом подкрашивает их в цвета картинки.\n'
-        'Это решает проблему рваных форм!\n\n'
-        '<b>Команда /size:</b>\n'
-        '• 500-800 — для мелких портретов (будет много цифр)\n'
-        '• 1500 — стандартный баланс\n'
-        '• 3000+ — для пейзажей (крупные зоны)',
+        '📖 <b>Справка</b>\n\n'
+        '<b>Команды:</b>\n'
+        '• /start — начать\n'
+        '• /colors N — цветов (3-48)\n'
+        '• /detail N — мин. область (50-500)\n'
+        '• /help — справка',
         parse_mode='HTML'
     )
 
-def main() -> None:
-    if not SLIC_AVAILABLE:
-        logger.error("Модуль cv2.ximgproc не найден! Установите opencv-contrib-python")
-        return
 
+def main() -> None:
     application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('size', set_size))
+    application.add_handler(CommandHandler('colors', set_colors))
+    application.add_handler(CommandHandler('detail', set_detail))
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
     
-    logger.info('🎨 SLIC Bot запущен!')
+    logger.info('🎨 Бот запущен!')
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == '__main__':
     main()
