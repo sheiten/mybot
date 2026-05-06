@@ -116,25 +116,24 @@ def merge_with_morphology(quantized: np.ndarray, palette: List[Tuple[int, int, i
     
     return new_quantized
 
-def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
-                                min_region_size: int, line_thickness: int, 
-                                line_color: str, font_size: int) -> io.BytesIO:
-    """Создаёт векторную раскраску SVG с контурами и номерами"""
+def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
+                               min_region_size: int, line_thickness: int, 
+                               line_color: str, font_size: int) -> io.BytesIO:
+    """Создаёт растровую раскраску PNG с контурами и номерами"""
     h, w = quantized.shape[:2]
     
+    # Цвет линий
     color_map = {
-        'gray': '#b4b4b4',
-        'dark': '#646464',
-        'light': '#d2d2d2'
+        'gray': [180, 180, 180],
+        'dark': [100, 100, 100],
+        'light': [210, 210, 210]
     }
-    stroke_color = color_map.get(line_color, '#b4b4b4')
+    line_rgb = color_map.get(line_color, [180, 180, 180])
     
-    dwg = svgwrite.Drawing(profile='tiny', size=(w, h))
-    dwg.add(dwg.rect(insert=(0, 0), size=(w, h), fill='white'))
+    # Создаём белый холст
+    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
     
-    placed_positions = []
-    font_family = "Arial, sans-serif"
-    
+    # Для каждого цвета находим контуры
     for color_idx, color in enumerate(palette):
         color_np = np.array(color)
         mask = np.all(quantized == color_np, axis=2).astype(np.uint8) * 255
@@ -146,12 +145,30 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
             if area < min_region_size:
                 continue
             
-            points = contour.reshape(-1, 2).tolist()
-            if len(points) < 3:
+            # Рисуем контур на холсте
+            cv2.drawContours(canvas, [contour], -1, line_rgb, line_thickness)
+    
+    # Преобразуем в PIL для рисования номеров
+    pil_canvas = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(pil_canvas)
+    
+    try:
+        font = ImageFont.truetype("Arial.ttf", font_size)
+    except:
+        font = ImageFont.load_default()
+    
+    placed_positions = []
+    
+    for color_idx, color in enumerate(palette):
+        color_np = np.array(color)
+        mask = np.all(quantized == color_np, axis=2).astype(np.uint8) * 255
+        
+        contours, hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_region_size:
                 continue
-            
-            path_data = 'M ' + ' L '.join([f'{x},{y}' for x, y in points]) + ' Z'
-            dwg.add(dwg.path(d=path_data, fill='none', stroke=stroke_color, stroke_width=line_thickness))
             
             M = cv2.moments(contour)
             if M["m00"] != 0:
@@ -169,33 +186,24 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
                 continue
             
             num_str = str(color_idx + 1)
-            text_width = len(num_str) * font_size * 0.6
-            text_height = font_size * 1.2
+            bbox = draw.textbbox((0, 0), num_str, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
             
-            dwg.add(dwg.rect(
-                insert=(cx - text_width / 2 - 2, cy - text_height / 2 - 2),
-                size=(text_width + 4, text_height + 4),
-                fill='white'
-            ))
-            dwg.add(dwg.text(
-                num_str,
-                insert=(cx, cy + font_size * 0.35),
-                fill='black',
-                font_size=font_size,
-                font_family=font_family,
-                text_anchor='middle'
-            ))
+            padding = 2
+            draw.rectangle(
+                [cx - text_w // 2 - padding, cy - text_h // 2 - padding,
+                 cx + text_w // 2 + padding, cy + text_h // 2 + padding],
+                fill='white',
+                outline=None
+            )
+            draw.text((cx - text_w // 2, cy - text_h // 2), num_str, fill=(0, 0, 0), font=font)
             placed_positions.append((cx, cy))
     
-    # 👇 ИСПРАВЛЕНИЕ: используем StringIO, а не BytesIO
-    output = io.StringIO()
-    dwg.write(output)
-    svg_string = output.getvalue()
-    output.close()
-    
-    # Конвертируем строку в байты для Telegram
-    return io.BytesIO(svg_string.encode('utf-8'))
-
+    output = io.BytesIO()
+    pil_canvas.save(output, format='PNG', dpi=(300, 300))
+    output.seek(0)
+    return output
 def create_palette_image(palette: List[Tuple[int, int, int]]) -> Image.Image:
     """Палитра"""
     n_colors = len(palette)
