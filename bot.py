@@ -364,7 +364,7 @@ async def set_smooth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ВАЖНО: Замените 1234567890 на ваш реальный Telegram ID
 # Чтобы узнать свой ID, отправьте боту /myid
-ADMIN_ID = 1234567890  # <--- ЗАМЕНИТЕ НА ВАШ ID
+ADMIN_ID = 931848809  # <--- ЗАМЕНИТЕ НА ВАШ ID
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
