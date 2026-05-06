@@ -583,36 +583,149 @@ def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[i
     image = Image.open(io.BytesIO(photo_bytes))
     if image.mode != 'RGB': image = image.convert('RGB')
     width, height = image.size
+    
+    # Ресайз при необходимости
     if max(width, height) > config.max_image_size:
         ratio = config.max_image_size / max(width, height)
-        new_size = (int(width * ratio), int(height * ratio))
-        image = image.resize(new_size, Image.Resampling.LANCZOS)
+        image = image.resize((int(width * ratio), int(height * ratio)), Image.Resampling.LANCZOS)
+    
     img_array = np.array(image)
+    h, w = img_array.shape[:2]
     
-    logger.info("🎨 Segmentation...")
-    quantized, labels, palette = segment_image_advanced(img_array, config)
+    # 1. Упрощение цветов (Color Quantization) через K-Means
+    logger.info(f"1. Упрощение цветов до {config.n_colors}...")
+    pixels = img_array.reshape(-1, 3).astype(np.float32)
+    kmeans = KMeans(n_clusters=config.n_colors, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(pixels)
+    centers = kmeans.cluster_centers_.astype(np.uint8)
+
+    # Сортировка палитры по яркости для красивого вывода
+    brightness = np.dot(centers, [0.299, 0.587, 0.114])
+    sorted_indices = np.argsort(brightness)
+    palette = [tuple(centers[i]) for i in sorted_indices]
     
-    logger.info("✂️ Removing thin regions...")
-    quantized = remove_thin_regions_scan(quantized, min_length=7, iterations=3)
+    # Пересоздаём quantized image с отсортированной палитрой
+    quantized_flat = np.zeros_like(pixels)
+    for new_idx, old_idx in enumerate(sorted_indices):
+        quantized_flat[labels == old_idx] = centers[old_idx]
+    quantized = quantized_flat.reshape(h, w, 3)
+
+    # 2. Фильтрация шума
+    logger.info("2. Очистка шума...")
+    quantized = cv2.medianBlur(quantized, 3)
+
+    # 3. Поиск и слияние малых регионов
+    logger.info(f"3. Слияние регионов меньше {config.min_region_size} пикселей...")
+    label_map = np.zeros((h, w), dtype=np.int32)
     
-    logger.info("🔗 Merging regions...")
-    quantized, labels, palette = merge_regions_rag(quantized, labels, palette, min_area=config.min_region_size, target_regions=config.n_colors * 4)
+    # Сначала создадим начальную карту регионов
+    for idx, color in enumerate(palette):
+        mask = np.all(quantized == color, axis=2)
+        label_map[mask] = idx + 1
+
+    # Теперь для каждого цвета находим регионы и сливаем маленькие
+    final_label_map = np.zeros((h, w), dtype=np.int32)
+    current_label = 1
+    region_id_to_color = {}
+
+    for color_idx, color in enumerate(palette):
+        mask = np.uint8(label_map == (color_idx + 1)) * 255
+        num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        
+        # Проходим по каждому региону этого цвета
+        for comp_id in range(1, num_labels):
+            area = stats[comp_id, cv2.CC_STAT_AREA]
+            if area >= config.min_region_size:
+                # Достаточно большой — оставляем как есть
+                final_label_map[labels_im == comp_id] = current_label
+                region_id_to_color[current_label] = color
+                current_label += 1
+            else:
+                # Слишком маленький — ищем самого большого соседа
+                component_mask = np.uint8(labels_im == comp_id)
+                dilated = cv2.dilate(component_mask, np.ones((3,3), np.uint8)) 
+                boundary = dilated - component_mask
+                
+                # Смотрим, какие регионы (не этого цвета) граничат
+                neighbor_labels = final_label_map[boundary > 0]
+                if len(neighbor_labels) == 0: continue
+                
+                # Считаем, какой сосед имеет наибольшую площадь
+                best_neighbor = 0
+                max_area = 0
+                for nl in np.unique(neighbor_labels):
+                    if nl == 0: continue
+                    neighbor_area = np.sum(final_label_map == nl)
+                    if neighbor_area > max_area:
+                        max_area = neighbor_area
+                        best_neighbor = nl
+                
+                # Присваиваем цвет самого крупного соседа
+                if best_neighbor > 0:
+                    target_color = region_id_to_color[best_neighbor]
+                    final_label_map[labels_im == comp_id] = best_neighbor
+                    # Обновляем квантованное изображение
+                    quantized[labels_im == comp_id] = target_color
+
+    # 4. Генерация финальной раскраски
+    logger.info("4. Создание раскраски и расстановка номеров...")
+    canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
+    line_rgb = config.line_rgb
     
-    logger.info("✏️ Generating output...")
-    coloring_buffer = create_coloring_page_raster(quantized, palette, config)
+    # Рисуем границы
+    grad_x = np.abs(np.diff(final_label_map, axis=1, prepend=final_label_map[:, :1]))
+    grad_y = np.abs(np.diff(final_label_map, axis=0, prepend=final_label_map[:1, :]))
+    boundary_mask = ((grad_x > 0) | (grad_y > 0)).astype(np.uint8)
+    boundary_mask = cv2.dilate(boundary_mask, np.ones((3,3)), iterations=config.line_thickness)
+    canvas[boundary_mask > 0] = line_rgb
     
+    # Расставляем номера в центроидах
+    final_palette = []
+    placed_positions = []
+    font = get_font(config.font_size)
+    
+    # Пересоздаём палитру для оставшихся цветов
+    remaining_labels = np.unique(final_label_map)
+    remaining_labels = remaining_labels[remaining_labels != 0]
+    
+    for label in remaining_labels:
+        color = region_id_to_color[label]
+        if color not in final_palette:
+            final_palette.append(color)
+    
+    for label in remaining_labels:
+        mask = np.uint8(final_label_map == label)
+        num, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        
+        # Для больших регионов может быть несколько компонент связности, но мы возьмём первую
+        if num > 1 and stats[1, cv2.CC_STAT_AREA] > 100:
+            cx, cy = int(centroids[1][0]), int(centroids[1][1])
+            color = region_id_to_color[label]
+            color_idx = final_palette.index(color) + 1
+            
+            if 0 <= cx < w and 0 <= cy < h:
+                num_str = str(color_idx)
+                pil_img = Image.fromarray(canvas)
+                draw = ImageDraw.Draw(pil_img)
+                
+                text_w, text_h = draw.textbbox((0, 0), num_str, font=font)[2:]
+                draw.rectangle([cx - text_w//2 - 2, cy - text_h//2 - 2, 
+                                cx + text_w//2 + 2, cy + text_h//2 + 2], fill=(255, 255, 255))
+                draw.text((cx - text_w//2, cy - text_h//2), num_str, fill='black', font=font)
+                canvas = np.array(pil_img)
+
+    # 5. Подготовка результатов
+    coloring_buffer = io.BytesIO()
+    Image.fromarray(canvas).save(coloring_buffer, format='PNG', dpi=(300, 300))
+    coloring_buffer.seek(0)
+
     palette_buffer = io.BytesIO()
-    palette_img = create_palette_image(palette, config)
+    palette_img = create_palette_image(final_palette, config)
     palette_img.save(palette_buffer, format='PNG', dpi=(300, 300))
     palette_buffer.seek(0)
-    
-    svg_output = None
-    if config.export_svg:
-        try: svg_output = generate_svg_output(quantized, palette, config)
-        except Exception as e: logger.warning(f"SVG failed: {e}")
-        
-    return coloring_buffer, palette_buffer, svg_output
 
+    logger.info("Готово! Раскраска создана.")
+    return coloring_buffer, palette_buffer, None
 
 # ============================================
 # TELEGRAM BOT HANDLERS
