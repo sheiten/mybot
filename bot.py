@@ -162,12 +162,9 @@ def find_regions_with_merging(quantized: np.ndarray, palette: List[Tuple[int, in
 def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
                                 min_region_size: int, line_thickness: int, 
                                 line_color: str, font_size: int) -> io.BytesIO:
-    """
-    Создаёт векторную раскраску (SVG) с контурами и номерами.
-    """
+    """Создаёт векторную раскраску (SVG) с контурами и номерами"""
     h, w = quantized.shape[:2]
     
-    # Цвет линий
     color_map = {
         'gray': '#b4b4b4',
         'dark': '#646464',
@@ -175,19 +172,16 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
     }
     stroke_color = color_map.get(line_color, '#b4b4b4')
     
-    # Создаём SVG-документ
     dwg = svgwrite.Drawing(profile='tiny', size=(w, h))
     dwg.add(dwg.rect(insert=(0, 0), size=(w, h), fill='white'))
     
     placed_positions = []
     font_family = "Arial, sans-serif"
     
-    # Для каждого цвета
     for color_idx, color in enumerate(palette):
         color_np = np.array(color)
         mask = np.all(quantized == color_np, axis=2).astype(np.uint8) * 255
         
-        # Находим контуры через OpenCV
         contours, hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         for contour in contours:
@@ -195,18 +189,13 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
             if area < min_region_size:
                 continue
             
-            # Преобразуем контур в SVG-путь
             points = contour.reshape(-1, 2).tolist()
             if len(points) < 3:
                 continue
             
-            # Создаём замкнутый путь
             path_data = 'M ' + ' L '.join([f'{x},{y}' for x, y in points]) + ' Z'
-            
-            # Рисуем контур
             dwg.add(dwg.path(d=path_data, fill='none', stroke=stroke_color, stroke_width=line_thickness))
             
-            # Находим центр для номера
             M = cv2.moments(contour)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
@@ -214,22 +203,15 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
             else:
                 continue
             
-            # Проверка, не слишком близко к другому номеру
             too_close = False
             for px, py in placed_positions:
                 if math.sqrt((cx - px) ** 2 + (cy - py) ** 2) < font_size * 3:
                     too_close = True
                     break
-            
             if too_close:
                 continue
             
-            # Рисуем номер (в SVG это проще)
             num_str = str(color_idx + 1)
-            
-            # Фон для номера (белый прямоугольник)
-            # В SVG можно использовать text с background, но проще — прямоугольник
-            # Вычисляем примерный размер текста
             text_width = len(num_str) * font_size * 0.6
             text_height = font_size * 1.2
             
@@ -239,20 +221,18 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
                 fill='white'
             ))
             
-            # Текст номера
+            # 👇 ЗДЕСЬ УБРАЛИ dominant_baseline
             dwg.add(dwg.text(
                 num_str,
                 insert=(cx, cy + font_size * 0.35),
                 fill='black',
                 font_size=font_size,
                 font_family=font_family,
-                text_anchor='middle',
-                dominant_baseline='middle'
+                text_anchor='middle'
             ))
             
             placed_positions.append((cx, cy))
     
-    # Сохраняем в буфер
     output = io.BytesIO()
     dwg.write(output, encoding='utf-8')
     output.seek(0)
