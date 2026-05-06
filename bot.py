@@ -563,69 +563,6 @@ def create_coloring_page_raster(
    output.seek(0)
 
    return output
-    
-def safe_text_size(text: str, font_obj) -> Tuple[int, int]:
-    try:
-        if hasattr(font_obj, 'getbbox'):
-                bbox = font_obj.getbbox(text)
-                return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
-        elif hasattr(font_obj, 'getsize'):
-                return font_obj.getsize(text)
-            except: pass
-                return max(1, font_size * len(text) // 2), max(1, font_size)
-label_map = np.zeros((h, w), dtype=np.int32)
-    for color_idx, color in enumerate(palette):
-        mask = np.all(quantized == color, axis=2)
-        label_map[mask] = color_idx + 1
-    
-    grad_x = np.abs(np.diff(label_map, axis=1, prepend=label_map[:, :1]))
-    grad_y = np.abs(np.diff(label_map, axis=0, prepend=label_map[:1, :]))
-    boundary_mask = ((grad_x > 0) | (grad_y > 0)).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    boundary_mask = cv2.dilate(boundary_mask, kernel, iterations=config.line_thickness)
-    
-    contours, _ = cv2.findContours(boundary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contour_canvas = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(contour_canvas, contours, -1, 255, thickness=1)
-    canvas[contour_canvas > 0] = line_rgb
-    
-    placed_positions = []
-    regions_with_numbers = 0
-    
-    for color_idx, color in enumerate(palette):
-        color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        num, labels_img, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=4, ltype=cv2.CV_32S)
-        
-        for comp_id in range(1, num):
-            if stats[comp_id, cv2.CC_STAT_AREA] < config.min_region_size: continue
-            comp_mask = (labels_img == comp_id).astype(np.uint8)
-            pole = get_pole_of_inaccessibility(comp_mask)
-            if pole is None: continue
-            cx, cy = pole
-            
-            if any(math.hypot(cx - px, cy - py) < font_size * 2.5 for px, py in placed_positions):
-                continue
-            
-            num_str = str(color_idx + 1)
-            text_w, text_h = safe_text_size(num_str, font)
-            padding = 3
-            x1, y1 = max(0, cx - text_w//2 - padding), max(0, cy - text_h//2 - padding)
-            x2, y2 = min(w, cx + text_w//2 + padding), min(h, cy + text_h//2 + padding)
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
-            
-            pil_img = Image.fromarray(canvas)
-            draw = ImageDraw.Draw(pil_img)
-            draw.text((cx - text_w//2, cy - text_h//2 + 1), num_str, fill='black', font=font)
-            canvas = np.array(pil_img)
-            placed_positions.append((cx, cy))
-            regions_with_numbers += 1
-            
-    output = io.BytesIO()
-    Image.fromarray(canvas).save(output, format='PNG', dpi=(300, 300))
-    output.seek(0)
-    return output
 
 def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int,int,int]], config: PBNConfig) -> str:
     h, w = quantized.shape[:2]
