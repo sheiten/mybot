@@ -500,6 +500,10 @@ def create_coloring_page_raster(
 
            cx, cy = pole
 
+           # Исправление выхода за границы массива
+           cx = min(max(int(cx), 0), w - 1)
+           cy = min(max(int(cy), 0), h - 1)
+
            # ------------------------------------------
            # Авторазмер шрифта
            # ------------------------------------------
@@ -532,6 +536,16 @@ def create_coloring_page_raster(
            y1 = max(0, cy - text_h // 2 - pad)
            x2 = min(w, cx + text_w // 2 + pad)
            y2 = min(h, cy + text_h // 2 + pad)
+
+           # Приведение к int и повторная проверка границ
+           x1 = int(max(0, x1))
+           y1 = int(max(0, y1))
+           x2 = int(min(w - 1, x2))
+           y2 = int(min(h - 1, y2))
+
+           # Проверка на пустой срез
+           if x2 <= x1 or y2 <= y1:
+               continue
 
            # уже занято?
            if np.any(placed_mask[y1:y2, x1:x2]):
