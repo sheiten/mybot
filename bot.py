@@ -175,13 +175,11 @@ def get_font(size: int) -> ImageFont.FreeTypeFont:
         except (IOError, OSError, ValueError, AttributeError):
             continue
     
-    # 👇 Ultimate fallback: use PIL's built-in bitmap font safely
+    # Ultimate fallback: use PIL's built-in bitmap font safely
     logger.warning(f"No TrueType font found for size {size}, using fallback")
     try:
-        # Try to load a small bitmap font that always exists
         return ImageFont.load_default()
     except Exception:
-        # If all else fails, return None and handle in caller
         return None
 
 # ============================================
@@ -372,16 +370,17 @@ def merge_small_regions(quantized: np.ndarray, labels: np.ndarray,
 # SMART NUMBER PLACEMENT
 # ============================================
 
-def find_optimal_number_position_v2(contour: np.ndarray, mask: np.ndarray, 
-                                   font_size: int, placed_positions: List[Tuple[int, int]],
-                                   min_distance_factor: float = 2.5) -> Optional[Tuple[int, int]]:
+def find_number_position_simple(contour: np.ndarray, mask: np.ndarray, 
+                               font_size: int, placed_positions: List[Tuple[int, int]],
+                               min_dist: float = 20.0) -> Optional[Tuple[int, int]]:
     """
-    Improved number placement with strict boundary checking.
+    SIMPLE version: just find centroid and check it's inside.
+    Much more permissive than v2.
     """
     if len(contour) < 3:
         return None
     
-    # 1. Try centroid
+    # Centroid
     M = cv2.moments(contour)
     if M["m00"] == 0:
         return None
@@ -389,77 +388,32 @@ def find_optimal_number_position_v2(contour: np.ndarray, mask: np.ndarray,
     cx = int(M["m10"] / M["m00"])
     cy = int(M["m01"] / M["m00"])
     
-    # Ensure native Python types
-    cx, cy = int(cx), int(cy)
-    
-    # 2. Check if centroid is inside contour
-    try:
-        dist = cv2.pointPolygonTest(contour, (float(cx), float(cy)), True)
-    except (cv2.error, TypeError, ValueError) as e:
-        logger.debug(f"pointPolygonTest failed at centroid: {e}")
-        dist = -1
-    
-    min_margin = font_size * 2.5
-    
-    # 3. If too close to boundary or outside, use distance transform
-    if dist < min_margin:
-        # Distance transform
-        dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-        
-        # Create mask for valid positions (far from boundary)
-        valid_positions = (dist_transform >= min_margin).astype(np.uint8)
-        
-        if np.sum(valid_positions) > 0:
-            # Find best position among valid ones
-            masked_dist = dist_transform * valid_positions
-            max_idx = np.argmax(masked_dist)
-            cy, cx = np.unravel_index(max_idx, masked_dist.shape)
-            cx, cy = int(cx), int(cy)
-        else:
-            # Fallback: just use max distance point
-            max_idx = np.argmax(dist_transform)
-            cy, cx = np.unravel_index(max_idx, dist_transform.shape)
-            cx, cy = int(cx), int(cy)
-    
-    # 4. Final validation: must be inside contour
+    # Check if inside contour
     try:
         if cv2.pointPolygonTest(contour, (float(cx), float(cy)), False) < 0:
-            logger.debug(f"Centroid {cx},{cy} is outside contour, skipping")
-            return None
-    except (cv2.error, TypeError, ValueError):
+            # If centroid is outside, find point inside via distance transform
+            dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+            max_loc = np.argmax(dist_transform)
+            cy, cx = np.unravel_index(max_loc, dist_transform.shape)
+            cx, cy = int(cx), int(cy)
+    except (cv2.error, TypeError, ValueError, AttributeError):
         return None
     
-    # 5. Check collisions with other numbers
-    min_dist = font_size * min_distance_factor
+    # Check collisions (less strict)
     for px, py in placed_positions:
-        dist_to_other = math.hypot(cx - px, cy - py)
-        if dist_to_other < min_dist:
+        if math.hypot(cx - px, cy - py) < min_dist:
             # Try to move away
             angle = math.atan2(cy - py, cx - px) + math.pi
-            new_cx = cx + int(min_dist * 0.6 * math.cos(angle))
-            new_cy = cy + int(min_dist * 0.6 * math.sin(angle))
-            
-            # Check if new position is valid
-            try:
-                if cv2.pointPolygonTest(contour, (float(new_cx), float(new_cy)), False) >= 0:
-                    # Also check distance to boundary
-                    new_dist = cv2.pointPolygonTest(contour, (float(new_cx), float(new_cy)), True)
-                    if new_dist >= min_margin * 0.5:
-                        cx, cy = new_cx, new_cy
-                        break
-            except (cv2.error, TypeError, ValueError):
-                pass
-            
-            # If can't resolve collision, skip this region
-            logger.debug(f"Can't place number {cx},{cy} due to collision at {px},{py}")
-            return None
+            cx += int(min_dist * math.cos(angle))
+            cy += int(min_dist * math.sin(angle))
+            break
     
-    # 6. Final bounds check
-    if not (0 <= cx < mask.shape[1] and 0 <= cy < mask.shape[0]):
-        return None
+    # Final bounds check
+    h, w = mask.shape
+    if 0 <= cx < w and 0 <= cy < h:
+        return cx, cy
     
-    return cx, cy
-
+    return None
 
 # ============================================
 # CONTOUR & SVG GENERATION
@@ -491,12 +445,11 @@ def contour_to_svg_path(contour: np.ndarray) -> str:
 
 def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
                        config: PBNConfig) -> str:
-    """Generate SVG format coloring page"""
+    """Generate SVG format coloring page — FIXED VERSION"""
     h, w = quantized.shape[:2]
     line_rgb = config.line_rgb
     font_size = config.font_size
     
-    # SVG header
     svg_parts = [
         f'<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
@@ -521,8 +474,9 @@ def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int, int, int
             if path_d:
                 svg_parts.append(f'<path class="region" d="{path_d}"/>')
             
-            # Place number
-            pos = find_optimal_number_position(contour, color_mask, font_size, placed_positions)
+            # Place number — FIXED: use simple version
+            pos = find_number_position_simple(contour, color_mask, font_size, 
+                                             placed_positions, min_dist=font_size*2.0)
             if pos:
                 cx, cy = pos
                 num_str = str(color_idx + 1)
@@ -530,7 +484,7 @@ def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int, int, int
                 # White background circle for readability
                 svg_parts.append(f'<circle cx="{cx}" cy="{cy}" r="{font_size//2 + 2}" fill="white"/>')
                 svg_parts.append(f'<text x="{cx}" y="{cy}" text-anchor="middle" dominant-baseline="central" '
-                               f'font-size="{font_size}" font-family="Arial" fill="black">{num_str}</text>')
+                               f'font-size="{font_size}" font-family="Arial, sans-serif" fill="black">{num_str}</text>')
                 placed_positions.append((cx, cy))
     
     svg_parts.append('</svg>')
@@ -541,144 +495,127 @@ def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int, int, int
 # RASTER OUTPUT GENERATION & UTILS
 # ============================================
 
-def filter_regions_by_iou(regions: List[dict], iou_threshold: float = 0.85) -> List[dict]:
-    """
-    Удаляет дублирующиеся регионы (контуры с высоким перекрытием).
-    Принимает список словарей {'contour': ..., 'color_idx': ...}
-    """
-    if not regions:
-        return []
-    
-    def calc_iou(c1: np.ndarray, c2: np.ndarray) -> float:
-        x1, y1, w1, h1 = cv2.boundingRect(c1)
-        x2, y2, w2, h2 = cv2.boundingRect(c2)
-        
-        # Пересечение bounding box
-        xi = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
-        yi = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
-        intersection = xi * yi
-        
-        # Объединение площадей контуров
-        a1 = cv2.contourArea(c1)
-        a2 = cv2.contourArea(c2)
-        union = a1 + a2 - intersection
-        
-        return intersection / union if union > 0 else 0
-
-    filtered = []
-    for region in regions:
-        # Проверяем, не пересекается ли текущий регион с уже добавленными
-        is_dup = any(calc_iou(region['contour'], existing['contour']) > iou_threshold 
-                     for existing in filtered)
-        if not is_dup:
-            filtered.append(region)
-            
-    return filtered
-
-
 def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
                                config: PBNConfig) -> io.BytesIO:
     """
-    Generate PNG coloring page — FINAL CLEAN VERSION
-    • No duplicate contours (via IoU filtering)
-    • Numbers strictly inside regions
-    • Safe font handling
+    FIXED VERSION:
+    • Single contours at color boundaries (no duplicates)
+    • Numbers in ALL regions (relaxed checks)
     """
     h, w = quantized.shape[:2]
     line_rgb = config.line_rgb
     font_size = config.font_size
     
-    # White canvas
     canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
     font = get_font(font_size)
-    
     if font is None:
-        logger.warning("Font not loaded, using fallback")
         font = ImageFont.load_default()
     
     def safe_text_size(text: str, font_obj) -> Tuple[int, int]:
-        """Safe text size calculation for any font type"""
         try:
             if hasattr(font_obj, 'getbbox'):
                 bbox = font_obj.getbbox(text)
                 return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
             elif hasattr(font_obj, 'getsize'):
                 return font_obj.getsize(text)
-        except Exception:
+        except:
             pass
         return max(1, font_size * len(text) // 2), max(1, font_size)
     
-    # 🔹 ШАГ 1: Собираем все потенциальные регионы
-    regions_data = []
+    # 🔹 STEP 1: Create label map (each pixel gets color number)
+    label_map = np.zeros((h, w), dtype=np.int32)
+    for color_idx, color in enumerate(palette):
+        mask = np.all(quantized == color, axis=2)
+        label_map[mask] = color_idx + 1  # +1 so 0 is background
+    
+    # 🔹 STEP 2: Find BOUNDARIES between regions (where neighbors differ)
+    gradient_x = np.abs(np.diff(label_map, axis=1))
+    gradient_y = np.abs(np.diff(label_map, axis=0))
+    
+    # Create boundary mask
+    boundary_mask = np.zeros((h, w), dtype=np.uint8)
+    boundary_mask[:-1, :] |= (gradient_y > 0)  # horizontal boundaries
+    boundary_mask[:, :-1] |= (gradient_x > 0)  # vertical boundaries
+    
+    # Morphology to thicken lines
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    boundary_mask = cv2.dilate(boundary_mask, kernel, iterations=config.line_thickness)
+    
+    # 🔹 STEP 3: Find contours on unified boundary map
+    contours, _ = cv2.findContours(boundary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Draw ALL contours at once (single lines!)
+    contour_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(contour_mask, contours, -1, 255, thickness=1)
+    
+    # Apply color
+    canvas[contour_mask > 0] = line_rgb
+    
+    # 🔹 STEP 4: Find regions for number placement
+    # Use ORIGINAL color masks (not boundaries!)
+    placed_positions = []
+    regions_with_numbers = 0
     
     for color_idx, color in enumerate(palette):
         color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
         
-        contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Morphology for cleanup
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area >= config.min_region_size:
-                regions_data.append({
-                    'contour': contour,
-                    'color_idx': color_idx,
-                    'mask': color_mask,
-                    'area': area
-                })
-    
-    # 🔹 ШАГ 2: Фильтрация дублей (выносим логику в отдельную функцию)
-    filtered_regions = filter_regions_by_iou(regions_data, iou_threshold=0.85)
-    
-    logger.debug(f"📊 Regions: {len(regions_data)} raw → {len(filtered_regions)} after dedup")
-    
-    # 🔹 ШАГ 3: Рисуем ВСЕ контуры сразу на одной маске (устраняет двоение)
-    contour_mask = np.zeros((h, w), dtype=np.uint8)
-    for region in filtered_regions:
-        cv2.drawContours(contour_mask, [region['contour']], -1, 255, config.line_thickness)
-    
-    # Применяем цвет линий к канвасу только там, где есть контур
-    line_pixels = contour_mask > 0
-    canvas[line_pixels] = line_rgb
-    
-    # 🔹 ШАГ 4: Размещаем номера
-    placed_positions = []  # [(x, y), ...]
-    
-    for region in filtered_regions:
-        contour = region['contour']
-        mask = region['mask']
-        color_idx = region['color_idx']
-        num_str = str(color_idx + 1)
-        
-        # Находим позицию для номера
-        pos = find_optimal_number_position_v2(
-            contour, mask, font_size, placed_positions,
-            min_distance_factor=2.5
+        # Find connected components INSIDE this color area
+        num_labels, labels_img, stats, _ = cv2.connectedComponentsWithStats(
+            color_mask, connectivity=8, ltype=cv2.CV_32S
         )
         
-        if pos:
-            cx, cy = pos
-            text_w, text_h = safe_text_size(num_str, font)
+        for comp_id in range(1, num_labels):  # skip background (0)
+            area = stats[comp_id, cv2.CC_STAT_AREA]
             
-            # Белый фон под номером
-            padding = 3
-            x1 = max(0, cx - text_w // 2 - padding)
-            y1 = max(0, cy - text_h // 2 - padding)
-            x2 = min(w, cx + text_w // 2 + padding)
-            y2 = min(h, cy + text_h // 2 + padding)
+            # Skip too small
+            if area < config.min_region_size:
+                continue
             
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+            # Create mask for this component
+            comp_mask = (labels_img == comp_id).astype(np.uint8) * 255
             
-            # Рисуем номер через PIL
-            pil_img = Image.fromarray(canvas)
-            draw = ImageDraw.Draw(pil_img)
-            text_x = cx - text_w // 2
-            text_y = cy - text_h // 2 + 1
-            draw.text((text_x, text_y), num_str, fill='black', font=font)
-            canvas = np.array(pil_img)
+            # Find contour for position check
+            comp_contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not comp_contours:
+                continue
             
-            placed_positions.append((cx, cy))
+            contour = max(comp_contours, key=cv2.contourArea)
+            
+            # SIMPLIFIED number position search
+            pos = find_number_position_simple(contour, comp_mask, font_size, 
+                                             placed_positions, min_dist=font_size*2.0)
+            
+            if pos:
+                cx, cy = pos
+                num_str = str(color_idx + 1)
+                text_w, text_h = safe_text_size(num_str, font)
+                
+                # White background
+                padding = 2
+                x1 = max(0, cx - text_w//2 - padding)
+                y1 = max(0, cy - text_h//2 - padding)
+                x2 = min(w, cx + text_w//2 + padding)
+                y2 = min(h, cy + text_h//2 + padding)
+                
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+                
+                # Number
+                pil_img = Image.fromarray(canvas)
+                draw = ImageDraw.Draw(pil_img)
+                draw.text((cx - text_w//2, cy - text_h//2 + 1), num_str, 
+                         fill='black', font=font)
+                canvas = np.array(pil_img)
+                
+                placed_positions.append((cx, cy))
+                regions_with_numbers += 1
     
-    # 🔹 ШАГ 5: Сохраняем результат
+    logger.info(f"✅ Placed {regions_with_numbers} numbers in {len(palette)} colors")
+    
+    # Save
     output = io.BytesIO()
     Image.fromarray(canvas).save(output, format='PNG', dpi=(300, 300))
     output.seek(0)
