@@ -571,10 +571,9 @@ def safe_text_size(text: str, font_obj) -> Tuple[int, int]:
                 return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
         elif hasattr(font_obj, 'getsize'):
                 return font_obj.getsize(text)
-        except: pass
-        return max(1, font_size * len(text) // 2), max(1, font_size)
-    
-    label_map = np.zeros((h, w), dtype=np.int32)
+            except: pass
+                return max(1, font_size * len(text) // 2), max(1, font_size)
+label_map = np.zeros((h, w), dtype=np.int32)
     for color_idx, color in enumerate(palette):
         mask = np.all(quantized == color, axis=2)
         label_map[mask] = color_idx + 1
