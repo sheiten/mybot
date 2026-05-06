@@ -1,17 +1,22 @@
 FROM python:3.12-slim
+
 WORKDIR /app
 
-# Системные библиотеки, необходимые для opencv-python-headless
+# Системные библиотеки для OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем requirements.txt и устанавливаем все зависимости
+# Копируем зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код бота
-COPY bot.py .
+# Устанавливаем зависимости
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
+# Копируем ВЕСЬ код проекта (включая bot.py, генераторы и т.д.)
+COPY . .
+
+# Запуск
 CMD ["python", "bot.py"]
