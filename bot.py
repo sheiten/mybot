@@ -1,24 +1,7 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-🎨 Paint by Numbers — Advanced Generator Module
-Гибридный алгоритм: SLIC → Mean Shift → RAG Merging → Smart Placement
-
-Заменяет функции в вашем боте:
-• cluster_colors()
-• merge_small_regions() 
-• create_coloring_page_raster()
-• generate_svg_output()
-
-Добавляет:
-• remove_thin_regions_scan()
-"""
-
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFont
 from skimage.segmentation import slic, mark_boundaries
-from skimage.future import graph
 from scipy import ndimage as ndi
 from typing import List, Tuple, Optional, Dict
 import io
@@ -258,129 +241,161 @@ def remove_thin_regions_scan(quantized: np.ndarray, min_length: int = 7, iterati
 
 def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray, 
                       palette: List[Tuple[int,int,int]], 
-                      min_area: int, target_regions: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+                      min_area: int, target_regions: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int,int,int]]]:
     """
-    Умное слияние регионов через Region Adjacency Graph (RAG)
-    Эвристика: площадь × цветовое расстояние / количество соседей
+    Быстрое слияние регионов без skimage.future.graph.
+    Алгоритм:
+    1. Находит все компоненты.
+    2. Строит карту смежности (кто с кем граничит).
+    3. Итеративно сливает самые мелкие регионы с наиболее похожим по цвету соседом.
     """
     if target_regions is None:
-        target_regions = len(palette) * 3  # эвристика: ~3 региона на цвет
-    
+        target_regions = len(palette) * 4
+
     h, w = quantized.shape[:2]
-    new_labels = labels.copy()
-    new_quantized = quantized.copy()
+    current_labels = labels.copy()
+    current_quantized = quantized.copy()
+    current_palette = list(palette) # Копируем, чтобы можно было менять индексы
     
-    # 🔹 Шаг 1: Удаление микро-регионов через connected components
-    for color_idx in range(len(palette)):
-        color_mask = (labels == color_idx).astype(np.uint8)
-        num, comp_labels, stats, _ = cv2.connectedComponentsWithStats(
-            color_mask, connectivity=4, ltype=cv2.CV_32S)
+    # Предварительный расчет LAB цветов палитры для быстрого сравнения
+    palette_lab = cv2.cvtColor(
+        np.uint8([[c for c in current_palette]]), cv2.COLOR_RGB2LAB
+    ).astype(np.float32).squeeze()
+    
+    # Если палитра пустая или один цвет, выходим
+    if len(current_palette) <= 1:
+        return current_quantized, current_labels, current_palette
+
+    max_iterations = 10
+    for iteration in range(max_iterations):
+        # 1. Получаем статистику текущих регионов
+        # Используем connectedComponents для каждого цвета отдельно, чтобы сохранить маппинг
+        all_regions = [] # list of (color_idx, comp_id, area, mask_bool_array)
         
-        for comp_id in range(1, num):
-            if stats[comp_id, cv2.CC_STAT_AREA] < min_area // 3:
-                comp_mask = (comp_labels == comp_id)
-                # Найти соседей через dilate
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-                dilated = cv2.dilate(comp_mask.astype(np.uint8), kernel)
-                boundary = dilated - comp_mask.astype(np.uint8)
-                
-                if np.sum(boundary) > 0:
-                    neighbor_labels = new_labels[boundary > 0]
-                    if len(neighbor_labels) > 0:
-                        dominant = np.bincount(neighbor_labels.flatten()).argmax()
-                        new_labels[comp_mask] = dominant
-                        new_quantized[comp_mask] = palette[dominant]
-    
-    # 🔹 Шаг 2: Построение RAG для умного слияния
-    for iteration in range(5):  # максимум 5 итераций
-        # Подсчёт текущих регионов
-        region_data = []
-        for color_idx in range(len(palette)):
-            mask = (new_labels == color_idx).astype(np.uint8)
-            num, comp_labels, stats, centroids = cv2.connectedComponentsWithStats(
-                mask, connectivity=4, ltype=cv2.CV_32S)
+        # Это может быть медленно, если делать для каждого пикселя, поэтому оптимизируем:
+        # Сначала найдем уникальные метки в label map? Нет, у нас label map - это индекс цвета.
+        # Нам нужно разделить связные области внутри одного цвета.
+        
+        unique_colors_in_use = np.unique(current_labels)
+        
+        temp_label_map = np.zeros((h, w), dtype=np.int32) # Временная карта уникальных ID регионов
+        region_info = {} # id -> { 'color_idx': int, 'area': int, 'pixels': [(y,x)] }
+        next_region_id = 1
+        
+        for color_idx in unique_colors_in_use:
+            if color_idx == -1: continue # skip background if any
+            mask = (current_labels == color_idx).astype(np.uint8)
+            num, comps, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=4, ltype=cv2.CV_32S)
             
-            for i in range(1, num):
-                if stats[i, cv2.CC_STAT_AREA] >= min_area // 2:
-                    region_data.append({
-                        'color_idx': color_idx,
-                        'comp_id': i,
-                        'area': stats[i, cv2.CC_STAT_AREA],
-                        'centroid': centroids[i],
-                        'mask': (comp_labels == i)
-                    })
+            for i in range(1, num): # 0 - фон
+                if stats[i, cv2.CC_STAT_AREA] < 5: continue # игнорируем микро-шум < 5px
+                reg_id = next_region_id
+                region_mask = (comps == i)
+                temp_label_map[region_mask] = reg_id
+                
+                region_info[reg_id] = {
+                    'color_idx': int(color_idx),
+                    'area': int(stats[i, cv2.CC_STAT_AREA]),
+                    'mask': region_mask # сохраняем маску для быстрого доступа
+                }
+                next_region_id += 1
+
+        total_regions = len(region_info)
+        logger.debug(f"Iter {iteration}: {total_regions} regions found.")
         
-        total_regions = len(region_data)
         if total_regions <= target_regions:
             break
+            
+        # 2. Построение графа смежности (кто с кем граничит)
+        # Используем dilate на temp_label_map, чтобы найти границы
+        # Это быстрый способ найти соседей
+        neighbors_map = {rid: {} for rid in region_info.keys()} # rid -> {neighbor_rid: count_boundary_pixels}
         
-        # Построение графа смежности регионов
         # Для каждого региона находим соседей
-        region_neighbors = {}
-        for reg in region_data:
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            dilated = cv2.dilate(reg['mask'].astype(np.uint8), kernel)
-            boundary = dilated - reg['mask'].astype(np.uint8)
-            
-            if np.sum(boundary) > 0:
-                neighbor_colors = new_labels[boundary > 0]
-                unique_nb, counts = np.unique(neighbor_colors, return_counts=True)
-                region_neighbors[reg['comp_id']] = list(zip(unique_nb, counts))
-            else:
-                region_neighbors[reg['comp_id']] = []
+        # Оптимизация: делаем это через свертку или морфологию на общей карте меток
+        # Но проще пройтись по мелким регионам
         
-        # Поиск лучшей пары для слияния
-        best_score = float('inf')
-        best_pair = None
+        # Сортируем регионы по площади (от маленьких к большим)
+        sorted_regions = sorted(region_info.items(), key=lambda x: x[1]['area'])
         
-        # LAB цвета для расчёта расстояния
-        palette_lab = cv2.cvtColor(
-            np.uint8([[c for c in palette]]), cv2.COLOR_RGB2LAB
-        ).astype(np.float32).squeeze()
+        merged_count = 0
+        # Берем топ-50 самых мелких регионов для попытки слияния за итерацию
+        candidates = sorted_regions[:50] 
         
-        for reg in region_data:
-            if reg['area'] > np.median([r['area'] for r in region_data]) * 3:
-                continue  # пропускаем крупные регионы
-            
-            current_lab = palette_lab[reg['color_idx']]
-            
-            for nb_color, count in region_neighbors.get(reg['comp_id'], []):
-                if nb_color == reg['color_idx']:
-                    continue
-                nb_lab = palette_lab[nb_color]
-                color_dist = np.linalg.norm(current_lab - nb_lab)
+        for reg_id, info in candidates:
+            if info['area'] > np.median([r['area'] for r in region_info.values()]) * 2:
+                continue # Не трогаем крупные, если они не стали мелкими после предыдущих слияний
                 
-                # Эвристика: маленькая площадь × расстояние / частота соседа
-                score = reg['area'] * color_dist / (count + 1)
+            mask = info['mask']
+            # Находим границу
+            kernel = np.ones((3,3), np.uint8)
+            dilated = cv2.dilate(mask.astype(np.uint8), kernel)
+            boundary = dilated - mask.astype(np.uint8)
+            
+            if np.sum(boundary) == 0:
+                continue
                 
-                if score < best_score:
-                    best_score = score
-                    best_pair = (reg, nb_color)
-        
-        if best_pair is None:
-            break  # нечего сливать
-        
-        # Выполняем слияние
-        reg_to_merge, target_color = best_pair
-        new_labels[reg_to_merge['mask']] = target_color
-        new_quantized[reg_to_merge['mask']] = palette[target_color]
-    
-    # Обновление палитры
-    final_palette = np.unique(new_quantized.reshape(-1, 3), axis=0)
-    final_palette = [tuple(c) for c in final_palette]
-    
-    # Ремаппинг label_map под новую палитру
-    color_to_idx = {color: idx for idx, color in enumerate(final_palette)}
-    new_label_map = np.zeros_like(new_labels)
-    for color_idx, color in enumerate(palette):
-        if color in color_to_idx:
-            mask = (new_labels == color_idx)
-            new_label_map[mask] = color_to_idx[color]
-    
-    logger.info(f"🔗 Слияние: {len(final_palette)} цветов, ~{len(np.unique(new_label_map))} регионов")
-    
-    return new_quantized, new_label_map, final_palette
+            # Смотрим, какие регионы находятся на границе
+            neighbor_ids = np.unique(temp_label_map[boundary > 0])
+            neighbor_ids = neighbor_ids[neighbor_ids != reg_id] # убираем себя
+            
+            if len(neighbor_ids) == 0:
+                continue
+                
+            # Выбираем лучшего соседа: минимальное расстояние в LAB
+            current_lab = palette_lab[info['color_idx']]
+            best_neighbor_id = None
+            min_dist = float('inf')
+            
+            for nb_id in neighbor_ids:
+                if nb_id not in region_info: continue
+                nb_color_idx = region_info[nb_id]['color_idx']
+                nb_lab = palette_lab[nb_color_idx]
+                dist = np.linalg.norm(current_lab - nb_lab)
+                
+                # Эвристика: предпочитаем соседей с большей площадью (чтобы не создавать новые мелкие)
+                # Score = ColorDist / Area_Neighbor
+                score = dist / (region_info[nb_id]['area'] + 1)
+                
+                if score < min_dist:
+                    min_dist = score
+                    best_neighbor_id = nb_id
+            
+            if best_neighbor_id is not None:
+                # Сливаем reg_id в best_neighbor_id
+                target_color_idx = region_info[best_neighbor_id]['color_idx']
+                
+                # Обновляем карты
+                current_labels[mask] = target_color_idx
+                current_quantized[mask] = current_palette[target_color_idx]
+                
+                # Обновляем temp_label_map (важно для следующей итерации внутри цикла, 
+                # но для простоты пересчитаем его на следующей внешней итерации)
+                
+                # Помечаем регион как удаленный
+                del region_info[reg_id]
+                merged_count += 1
 
+        if merged_count == 0:
+            break # Нечего больше сливать
+            
+    # Финальная очистка палитры (удаляем цвета, которые исчезли)
+    final_unique_colors = np.unique(current_quantized.reshape(-1, 3), axis=0)
+    final_palette = [tuple(c) for c in final_unique_colors]
+    
+    # Пересчет labels под новую палитру
+    final_label_map = np.zeros((h, w), dtype=np.int32)
+    color_to_new_idx = {c: i for i, c in enumerate(final_palette)}
+    
+    # Это медленно делать по пиксельно, используем broadcasting или loop по цветам
+    # Так как цветов мало (<30), цикл ОК
+    for new_idx, color in enumerate(final_palette):
+        mask = np.all(current_quantized == color, axis=2)
+        final_label_map[mask] = new_idx
+        
+    logger.info(f"🔗 Merging complete. Final colors: {len(final_palette)}, Regions: ~{len(np.unique(final_label_map))}")
+    
+    return current_quantized, final_label_map, final_palette
 
 # ============================================
 # ✏️ ЗАМЕНА: create_coloring_page_raster()
