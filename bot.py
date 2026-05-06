@@ -151,26 +151,38 @@ def trigger_self_update() -> bool:
 
 
 def get_font(size: int) -> ImageFont.FreeTypeFont:
-    """Cross-platform font loader with fallbacks"""
+    """Cross-platform font loader with robust fallbacks"""
     font_candidates = [
+        # Windows
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        # Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        # macOS
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+        # Current directory / bundled
         "Arial.ttf",
         "arial.ttf",
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
-        Path("/System/Library/Fonts/Helvetica.ttc"),
-        Path("C:\\Windows\\Fonts\\arial.ttf"),
-        Path("C:\\Windows\\Fonts\\seguiemj.ttf"),  # Windows emoji font fallback
+        "DejaVuSans.ttf",
     ]
     
     for font_path in font_candidates:
         try:
             return ImageFont.truetype(str(font_path), size)
-        except (IOError, OSError, ValueError):
+        except (IOError, OSError, ValueError, AttributeError):
             continue
     
-    logger.warning("No TrueType font found, using default bitmap font")
-    return ImageFont.load_default()
-
+    # 👇 Ultimate fallback: use PIL's built-in bitmap font safely
+    logger.warning(f"No TrueType font found for size {size}, using fallback")
+    try:
+        # Try to load a small bitmap font that always exists
+        return ImageFont.load_default()
+    except Exception:
+        # If all else fails, return None and handle in caller
+        return None
 
 # ============================================
 # IMAGE PREPROCESSING
@@ -366,20 +378,28 @@ def find_optimal_number_position(contour: np.ndarray, mask: np.ndarray,
     """
     Find optimal position for number inside region using distance transform.
     Avoids boundaries and other numbers.
+    FIXED: Convert numpy ints to native Python types for OpenCV compatibility.
     """
     if len(contour) < 3:
         return None
     
-    # Try centroid first
+    # Try centroid first — CONVERT TO NATIVE INT
     M = cv2.moments(contour)
     if M["m00"] == 0:
         return None
     
+    # 👇 FIX: explicit int() conversion for OpenCV compatibility
     cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+    cx, cy = int(cx), int(cy)  # Ensure native Python int, not np.int64
     
-    # Check distance to boundary
-    dist_to_boundary = cv2.pointPolygonTest(contour, (cx, cy), True)
+    # Check distance to boundary — CONVERT POINT TO TUPLE OF FLOATS
     min_margin = font_size * 2
+    
+    try:
+        dist_to_boundary = cv2.pointPolygonTest(contour, (float(cx), float(cy)), True)
+    except (cv2.error, TypeError) as e:
+        logger.warning(f"pointPolygonTest failed at ({cx},{cy}): {e}, using fallback")
+        dist_to_boundary = -1  # Fallback to distance transform
     
     if dist_to_boundary < min_margin:
         # Use distance transform to find best interior point
@@ -392,11 +412,13 @@ def find_optimal_number_position(contour: np.ndarray, mask: np.ndarray,
             # Fallback: use point with max distance even if close to boundary
             max_loc = np.argmax(dist_transform)
             cy, cx = np.unravel_index(max_loc, dist_transform.shape)
+            cx, cy = int(cx), int(cy)
         else:
             # Mask the distance transform
             masked_dist = dist_transform * search_mask
             max_loc = np.argmax(masked_dist)
             cy, cx = np.unravel_index(max_loc, masked_dist.shape)
+            cx, cy = int(cx), int(cy)
     
     # Check for collisions with other placed numbers
     min_dist = font_size * min_distance_factor
@@ -408,8 +430,11 @@ def find_optimal_number_position(contour: np.ndarray, mask: np.ndarray,
             cy += int(min_dist * 0.5 * math.sin(angle))
             
             # Verify new position is still inside contour
-            if cv2.pointPolygonTest(contour, (cx, cy), False) < 0:
-                return None  # Can't place without collision
+            try:
+                if cv2.pointPolygonTest(contour, (float(cx), float(cy)), False) < 0:
+                    return None  # Can't place without collision
+            except (cv2.error, TypeError):
+                return None  # Safety fallback
             break
     
     return cx, cy
@@ -497,7 +522,7 @@ def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int, int, int
 
 def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
                                config: PBNConfig) -> io.BytesIO:
-    """Generate PNG coloring page with contours and numbers"""
+    """Generate PNG coloring page with contours and numbers — FIXED VERSION"""
     h, w = quantized.shape[:2]
     line_rgb = config.line_rgb
     font_size = config.font_size
@@ -505,6 +530,18 @@ def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, 
     # White canvas
     canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
     font = get_font(font_size)
+    
+    # 👇 FIX: Safe text bounds calculation for any font type
+    def get_text_size(text: str, font) -> Tuple[int, int]:
+        """Get text dimensions compatible with both FreeType and bitmap fonts"""
+        if hasattr(font, 'getbbox'):
+            bbox = font.getbbox(text)
+            return bbox[2] - bbox[0], bbox[3] - bbox[1]
+        elif hasattr(font, 'getsize'):
+            return font.getsize(text)
+        else:
+            # Fallback estimate for bitmap font
+            return font_size * len(text) // 2, font_size
     
     placed_positions = []
     
@@ -527,23 +564,30 @@ def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, 
                 cx, cy = pos
                 num_str = str(color_idx + 1)
                 
-                # Calculate text bounds for background
-                bbox = font.getbbox(num_str) if hasattr(font, 'getbbox') else (0, 0, font_size, font_size)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
+                # 👇 FIX: Safe text size calculation
+                text_w, text_h = get_text_size(num_str, font)
                 
-                # White background rectangle
-                padding = 2
-                draw = ImageDraw.Draw(Image.fromarray(canvas))
-                draw.rectangle(
-                    [cx - text_w // 2 - padding, cy - text_h // 2 - padding,
-                     cx + text_w // 2 + padding, cy + text_h // 2 + padding],
-                    fill='white'
-                )
-                draw.text((cx - text_w // 2, cy - text_h // 2), num_str, fill='black', font=font)
+                # White background rectangle for readability
+                padding = 3
+                x1 = max(0, cx - text_w // 2 - padding)
+                y1 = max(0, cy - text_h // 2 - padding)
+                x2 = min(w, cx + text_w // 2 + padding)
+                y2 = min(h, cy + text_h // 2 + padding)
                 
-                # Update canvas from PIL
-                canvas = np.array(Image.fromarray(canvas))
+                # Draw background using OpenCV (faster and more reliable)
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+                
+                # Draw text using PIL
+                pil_img = Image.fromarray(canvas)
+                draw = ImageDraw.Draw(pil_img)
+                
+                # Center text properly
+                text_x = cx - text_w // 2
+                text_y = cy - text_h // 2 + 2  # Small vertical adjustment for baseline
+                draw.text((text_x, text_y), num_str, fill='black', font=font)
+                
+                # Update canvas
+                canvas = np.array(pil_img)
                 placed_positions.append((cx, cy))
     
     # Save to buffer
