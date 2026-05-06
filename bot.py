@@ -17,16 +17,21 @@ TOKEN = os.environ.get('BOT_TOKEN', '')
 if not TOKEN:
     raise ValueError('BOT_TOKEN environment variable is not set!')
 
+# Настройки по умолчанию
 DEFAULT_N_COLORS = 24
-MIN_REGION_SIZE = 150
-MAX_IMAGE_SIZE = 1500
+DEFAULT_MIN_REGION_SIZE = 150
+DEFAULT_MAX_IMAGE_SIZE = 1500
+DEFAULT_LINE_THICKNESS = 1  # Толщина линии: 1, 2 или 3
+DEFAULT_LINE_COLOR = 'gray'  # Цвет линий: gray, dark, light
+DEFAULT_FONT_SIZE = 11      # Размер шрифта номеров: 9, 10, 11, 12, 13, 14
+DEFAULT_PREPROCESS_STRENGTH = 'medium'  # Сила предобработки: light, medium, strong
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> np.ndarray:
-    """Предобработка изображения"""
+def preprocess_image(image: Image.Image, target_size: int, strength: str = 'medium') -> np.ndarray:
+    """Предобработка изображения с настраиваемой силой"""
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
@@ -37,8 +42,15 @@ def preprocess_image(image: Image.Image, target_size: int = MAX_IMAGE_SIZE) -> n
     
     img_array = np.array(image)
     
-    # Лёгкое сглаживание для уменьшения шума
-    img_array = cv2.bilateralFilter(img_array, 7, 50, 50)
+    # Настройка силы фильтрации
+    if strength == 'light':
+        d, sigma = 5, 30
+    elif strength == 'medium':
+        d, sigma = 7, 50
+    else:  # strong
+        d, sigma = 9, 75
+    
+    img_array = cv2.bilateralFilter(img_array, d, sigma, sigma)
     
     return img_array
 
@@ -67,10 +79,7 @@ def cluster_colors(img_array: np.ndarray, n_colors: int) -> Tuple[np.ndarray, np
 
 
 def find_connected_regions(mask: np.ndarray, min_size: int = 100) -> List[Tuple[List[int], List[int], int, int]]:
-    """
-    Поиск связных областей через BFS (как в оригинальном IBNG)
-    Возвращает список регионов: (x_координаты, y_координаты, центр_x, центр_y)
-    """
+    """Поиск связных областей через BFS"""
     h, w = mask.shape
     visited = np.zeros_like(mask, dtype=bool)
     regions = []
@@ -78,7 +87,6 @@ def find_connected_regions(mask: np.ndarray, min_size: int = 100) -> List[Tuple[
     for y in range(h):
         for x in range(w):
             if mask[y, x] and not visited[y, x]:
-                # BFS
                 queue = deque([(x, y)])
                 region_x, region_y = [], []
                 
@@ -98,45 +106,30 @@ def find_connected_regions(mask: np.ndarray, min_size: int = 100) -> List[Tuple[
     return regions
 
 
-def get_center_in_region(mask: np.ndarray) -> Tuple[int, int]:
-    """
-    Умный поиск центра области (адаптировано из IBNG)
-    """
-    ys, xs = np.where(mask)
-    if len(ys) == 0:
-        return 0, 0
+def create_coloring_page(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
+                        min_region_size: int, line_thickness: int, line_color: str,
+                        font_size: int) -> Image.Image:
+    """Создание раскраски с настраиваемыми параметрами"""
+    h, w = quantized.shape[:2]
     
-    # Ищем центр по вертикали и горизонтали
-    center_x = int(np.mean(xs))
-    center_y = int(np.mean(ys))
-    
-    # Корректируем, чтобы центр был внутри
-    if not mask[center_y, center_x]:
-        # Ищем ближайшую точку внутри
-        distances = (xs - center_x) ** 2 + (ys - center_y) ** 2
-        idx = np.argmin(distances)
-        center_x, center_y = xs[idx], ys[idx]
-    
-    return center_x, center_y
-
-
-def create_coloring_page(img_array: np.ndarray, quantized: np.ndarray, labels: np.ndarray, 
-                        palette: List[Tuple[int, int, int]], min_region_size: int) -> Image.Image:
-    """
-    Создание раскраски по номерам (вдохновлено IBNG)
-    """
-    h, w = img_array.shape[:2]
+    # Определяем цвет линий
+    color_map = {
+        'gray': [180, 180, 180],
+        'dark': [100, 100, 100],
+        'light': [210, 210, 210]
+    }
+    line_rgb = color_map.get(line_color, [180, 180, 180])
     
     # Создаём холст
     canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
     
-    # Сначала находим ВСЕ контуры
+    # Находим все контуры
     all_contours_mask = np.zeros((h, w), dtype=bool)
     
     for color_idx, color in enumerate(palette):
         color_mask = np.all(quantized == color, axis=2)
         
-        # Находим контуры через разницу (метод из IBNG)
+        # Контуры через разницу
         padded = np.pad(color_mask, ((1, 1), (1, 1)), mode='constant')
         contours = (
             (padded[:-2, 1:-1] != padded[2:, 1:-1]) | 
@@ -145,15 +138,20 @@ def create_coloring_page(img_array: np.ndarray, quantized: np.ndarray, labels: n
         
         all_contours_mask |= contours
     
-    # Рисуем ВСЕ контуры серым цветом
-    canvas[all_contours_mask] = [180, 180, 180]
+    # Применяем толщину линии
+    if line_thickness > 1:
+        kernel = np.ones((line_thickness, line_thickness), np.uint8)
+        all_contours_mask = cv2.dilate(all_contours_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
     
-    # Теперь расставляем номера
+    # Рисуем контуры
+    canvas[all_contours_mask] = line_rgb
+    
+    # Расставляем номера
     pil_canvas = Image.fromarray(canvas)
     draw = ImageDraw.Draw(pil_canvas)
     
     try:
-        font = ImageFont.truetype("Arial.ttf", 11)
+        font = ImageFont.truetype("Arial.ttf", font_size)
     except:
         font = ImageFont.load_default()
     
@@ -161,15 +159,13 @@ def create_coloring_page(img_array: np.ndarray, quantized: np.ndarray, labels: n
     
     for color_idx, color in enumerate(palette):
         color_mask = np.all(quantized == color, axis=2)
-        
-        # Находим связные регионы
         regions = find_connected_regions(color_mask, min_region_size)
         
         for region_x, region_y, cx, cy in regions:
-            # Проверяем, не слишком ли близко к другим номерам
+            # Проверяем расстояние до других номеров
             too_close = False
             for px, py in placed_positions:
-                if math.sqrt((cx - px) ** 2 + (cy - py) ** 2) < 25:
+                if math.sqrt((cx - px) ** 2 + (cy - py) ** 2) < font_size * 2.5:
                     too_close = True
                     break
             
@@ -178,11 +174,14 @@ def create_coloring_page(img_array: np.ndarray, quantized: np.ndarray, labels: n
             
             # Проверяем, что центр внутри области
             if not color_mask[cy, cx]:
-                # Создаём мини-маску и находим центр
                 mini_mask = np.zeros((h, w), dtype=bool)
                 for rx, ry in zip(region_x, region_y):
                     mini_mask[ry, rx] = True
-                cx, cy = get_center_in_region(mini_mask)
+                ys, xs = np.where(mini_mask)
+                if len(ys) > 0:
+                    cx, cy = xs[len(xs)//2], ys[len(ys)//2]
+                else:
+                    continue
             
             # Рисуем номер
             num_str = str(color_idx + 1)
@@ -190,7 +189,6 @@ def create_coloring_page(img_array: np.ndarray, quantized: np.ndarray, labels: n
             text_w = bbox[2] - bbox[0]
             text_h = bbox[3] - bbox[1]
             
-            # Белый фон под номером
             padding = 2
             draw.rectangle(
                 [cx - text_w // 2 - padding, cy - text_h // 2 - padding,
@@ -199,7 +197,6 @@ def create_coloring_page(img_array: np.ndarray, quantized: np.ndarray, labels: n
                 outline=None
             )
             
-            # Рисуем номер
             draw.text((cx - text_w // 2, cy - text_h // 2), num_str, fill=(0, 0, 0), font=font)
             placed_positions.append((cx, cy))
     
@@ -252,14 +249,16 @@ def create_palette_image(palette: List[Tuple[int, int, int]]) -> Image.Image:
     return palette_img
 
 
-def process_image_for_coloring(photo_bytes: bytes, n_colors: int = DEFAULT_N_COLORS,
-                               min_region_size: int = MIN_REGION_SIZE) -> Tuple[io.BytesIO, io.BytesIO]:
-    """Основная функция обработки"""
+def process_image_for_coloring(photo_bytes: bytes, n_colors: int, min_region_size: int,
+                               line_thickness: int, line_color: str, font_size: int,
+                               max_image_size: int, preprocess_strength: str) -> Tuple[io.BytesIO, io.BytesIO]:
+    """Основная функция обработки со всеми параметрами"""
     image = Image.open(io.BytesIO(photo_bytes))
-    img_array = preprocess_image(image)
+    img_array = preprocess_image(image, max_image_size, preprocess_strength)
     
     quantized, labels, palette = cluster_colors(img_array, n_colors)
-    coloring_img = create_coloring_page(img_array, quantized, labels, palette, min_region_size)
+    coloring_img = create_coloring_page(quantized, palette, min_region_size, 
+                                       line_thickness, line_color, font_size)
     palette_img = create_palette_image(palette)
     
     coloring_buffer = io.BytesIO()
@@ -278,73 +277,190 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         '🎨 <b>Бот "Раскраска по номерам"</b>\n\n'
         'Отправьте фото — получите раскраску!\n\n'
-        '<b>Команды:</b>\n'
-        '• <code>/colors 24</code> — цветов (3-48)\n'
-        '• <code>/detail 150</code> — мин. область (50-500)\n'
-        '• <code>/help</code> — справка',
+        '<b>Основные команды:</b>\n'
+        '• <code>/colors 24</code> — количество цветов (3-48)\n'
+        '• <code>/detail 150</code> — мин. размер области (50-500)\n\n'
+        '<b>Тонкая настройка:</b>\n'
+        '• <code>/line 1</code> — толщина линий (1-3)\n'
+        '• <code>/linecolor gray</code> — цвет линий (gray/dark/light)\n'
+        '• <code>/font 11</code> — размер шрифта (9-14)\n'
+        '• <code>/size 1500</code> — макс. размер изображения (800-3000)\n'
+        '• <code>/smooth medium</code> — сглаживание (light/medium/strong)\n'
+        '• <code>/settings</code> — показать текущие настройки\n'
+        '• <code>/help</code> — подробная справка',
         parse_mode='HTML'
     )
 
 
+async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать текущие настройки"""
+    settings_text = (
+        '⚙️ <b>Текущие настройки:</b>\n\n'
+        f'🎨 Цветов: {context.user_data.get("n_colors", DEFAULT_N_COLORS)}\n'
+        f'📏 Мин. область: {context.user_data.get("min_region_size", DEFAULT_MIN_REGION_SIZE)}px\n'
+        f'📝 Толщина линий: {context.user_data.get("line_thickness", DEFAULT_LINE_THICKNESS)}\n'
+        f'🎨 Цвет линий: {context.user_data.get("line_color", DEFAULT_LINE_COLOR)}\n'
+        f'🔤 Размер шрифта: {context.user_data.get("font_size", DEFAULT_FONT_SIZE)}\n'
+        f'🖼️ Макс. размер: {context.user_data.get("max_image_size", DEFAULT_MAX_IMAGE_SIZE)}px\n'
+        f'🌊 Сглаживание: {context.user_data.get("preprocess_strength", DEFAULT_PREPROCESS_STRENGTH)}'
+    )
+    await update.message.reply_text(settings_text, parse_mode='HTML')
+
+
 async def set_colors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ <code>/colors 24</code>', parse_mode='HTML')
+        await update.message.reply_text('❌ Используйте: <code>/colors 24</code> (3-48)', parse_mode='HTML')
         return
     n_colors = int(context.args[0])
     if not 3 <= n_colors <= 48:
-        await update.message.reply_text('❌ 3-48 цветов', parse_mode='HTML')
+        await update.message.reply_text('❌ Допустимый диапазон: 3-48 цветов', parse_mode='HTML')
         return
     context.user_data['n_colors'] = n_colors
-    await update.message.reply_text(f'✅ {n_colors} цветов')
+    await update.message.reply_text(f'✅ Установлено {n_colors} цветов')
 
 
 async def set_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text('❌ <code>/detail 150</code>', parse_mode='HTML')
+        await update.message.reply_text('❌ Используйте: <code>/detail 150</code> (50-500)', parse_mode='HTML')
         return
     min_size = int(context.args[0])
     if not 50 <= min_size <= 500:
-        await update.message.reply_text('❌ 50-500', parse_mode='HTML')
+        await update.message.reply_text('❌ Допустимый диапазон: 50-500 px', parse_mode='HTML')
         return
-    context.user_data['min_size'] = min_size
+    context.user_data['min_region_size'] = min_size
     await update.message.reply_text(f'✅ Мин. область: {min_size}px')
+
+
+async def set_line_thickness(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Настройка толщины линий"""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text('❌ Используйте: <code>/line 1</code> (1-3)\n'
+                                      '1 = тонкие, 2 = средние, 3 = толстые', parse_mode='HTML')
+        return
+    thickness = int(context.args[0])
+    if not 1 <= thickness <= 3:
+        await update.message.reply_text('❌ Допустимый диапазон: 1-3', parse_mode='HTML')
+        return
+    context.user_data['line_thickness'] = thickness
+    names = {1: 'тонкие', 2: 'средние', 3: 'толстые'}
+    await update.message.reply_text(f'✅ Толщина линий: {names[thickness]}')
+
+
+async def set_line_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Настройка цвета линий"""
+    if not context.args or context.args[0].lower() not in ['gray', 'dark', 'light']:
+        await update.message.reply_text('❌ Используйте: <code>/linecolor gray</code>\n'
+                                      'Варианты: gray, dark, light', parse_mode='HTML')
+        return
+    color = context.args[0].lower()
+    context.user_data['line_color'] = color
+    names = {'gray': 'серые', 'dark': 'тёмные', 'light': 'светлые'}
+    await update.message.reply_text(f'✅ Цвет линий: {names[color]}')
+
+
+async def set_font_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Настройка размера шрифта номеров"""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text('❌ Используйте: <code>/font 11</code> (9-14)', parse_mode='HTML')
+        return
+    size = int(context.args[0])
+    if not 9 <= size <= 14:
+        await update.message.reply_text('❌ Допустимый диапазон: 9-14', parse_mode='HTML')
+        return
+    context.user_data['font_size'] = size
+    await update.message.reply_text(f'✅ Размер шрифта: {size}')
+
+
+async def set_max_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Настройка максимального размера изображения"""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text('❌ Используйте: <code>/size 1500</code> (800-3000)\n'
+                                      'Больше = детальнее, но медленнее', parse_mode='HTML')
+        return
+    size = int(context.args[0])
+    if not 800 <= size <= 3000:
+        await update.message.reply_text('❌ Допустимый диапазон: 800-3000', parse_mode='HTML')
+        return
+    context.user_data['max_image_size'] = size
+    await update.message.reply_text(f'✅ Макс. размер: {size}px')
+
+
+async def set_smooth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Настройка силы сглаживания"""
+    if not context.args or context.args[0].lower() not in ['light', 'medium', 'strong']:
+        await update.message.reply_text('❌ Используйте: <code>/smooth medium</code>\n'
+                                      'Варианты: light, medium, strong\n'
+                                      'light = больше деталей, strong = больше сглаживания', parse_mode='HTML')
+        return
+    strength = context.args[0].lower()
+    context.user_data['preprocess_strength'] = strength
+    names = {'light': 'слабое (больше деталей)', 'medium': 'среднее', 'strong': 'сильное (больше сглаживания)'}
+    await update.message.reply_text(f'✅ Сглаживание: {names[strength]}')
 
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     photo = message.photo[-1]
     
-    status_msg = await message.reply_text('🎨 Создаю раскраску...')
+    # Получаем все настройки
+    n_colors = context.user_data.get('n_colors', DEFAULT_N_COLORS)
+    min_region_size = context.user_data.get('min_region_size', DEFAULT_MIN_REGION_SIZE)
+    line_thickness = context.user_data.get('line_thickness', DEFAULT_LINE_THICKNESS)
+    line_color = context.user_data.get('line_color', DEFAULT_LINE_COLOR)
+    font_size = context.user_data.get('font_size', DEFAULT_FONT_SIZE)
+    max_image_size = context.user_data.get('max_image_size', DEFAULT_MAX_IMAGE_SIZE)
+    preprocess_strength = context.user_data.get('preprocess_strength', DEFAULT_PREPROCESS_STRENGTH)
+    
+    settings_text = (
+        f'🎨 Цветов: {n_colors} | 📏 Мин: {min_region_size}px\n'
+        f'📝 Линии: {line_thickness} | 🎨 Цвет: {line_color}\n'
+        f'🔤 Шрифт: {font_size} | 🌊 Сглаж: {preprocess_strength}'
+    )
+    
+    status_msg = await message.reply_text(f'🎨 Создаю раскраску...\n\n{settings_text}')
     
     try:
         file = await photo.get_file()
         photo_bytes = await file.download_as_bytearray()
         
-        n_colors = context.user_data.get('n_colors', DEFAULT_N_COLORS)
-        min_size = context.user_data.get('min_size', MIN_REGION_SIZE)
-        
         coloring_buffer, palette_buffer = await asyncio.to_thread(
-            process_image_for_coloring, bytes(photo_bytes), n_colors, min_size
+            process_image_for_coloring, bytes(photo_bytes), n_colors, min_region_size,
+            line_thickness, line_color, font_size, max_image_size, preprocess_strength
         )
         
-        await message.reply_photo(coloring_buffer, caption=f'🖼️ Раскраска!\n🎨 Цветов: {n_colors}')
+        await message.reply_photo(coloring_buffer, caption=f'🖼️ Раскраска!\n{settings_text}')
         await message.reply_photo(palette_buffer, caption='🎨 Палитра')
         
     except Exception as e:
         logger.error(f'Ошибка: {e}', exc_info=True)
-        await message.reply_text('❌ Ошибка обработки')
+        await message.reply_text('❌ Ошибка обработки. Попробуйте другие настройки.')
     finally:
         await status_msg.delete()
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        '📖 <b>Справка</b>\n\n'
-        '<b>Команды:</b>\n'
-        '• /start — начать\n'
-        '• /colors N — цветов (3-48)\n'
-        '• /detail N — мин. область (50-500)\n'
-        '• /help — справка',
+        '📖 <b>Полная справка</b>\n\n'
+        '<b>Основные команды:</b>\n'
+        '• <code>/colors N</code> — цветов (3-48, по умолч. 24)\n'
+        '  Больше цветов = больше деталей\n\n'
+        '• <code>/detail N</code> — мин. область (50-500, по умолч. 150)\n'
+        '  Меньше = больше мелких зон\n\n'
+        '<b>Тонкая настройка:</b>\n'
+        '• <code>/line N</code> — толщина линий (1-3, по умолч. 1)\n'
+        '  1 = тонкие, 2 = средние, 3 = толстые\n\n'
+        '• <code>/linecolor X</code> — цвет линий\n'
+        '  gray = серые, dark = тёмные, light = светлые\n\n'
+        '• <code>/font N</code> — размер шрифта (9-14, по умолч. 11)\n\n'
+        '• <code>/size N</code> — макс. размер (800-3000, по умолч. 1500)\n'
+        '  Больше = детальнее, но медленнее\n\n'
+        '• <code>/smooth X</code> — сглаживание\n'
+        '  light = слабое, medium = среднее, strong = сильное\n\n'
+        '• <code>/settings</code> — показать текущие настройки\n\n'
+        '<b>Рекомендации:</b>\n'
+        '• Для портретов: /colors 30 /detail 100 /smooth light\n'
+        '• Для пейзажей: /colors 20 /detail 200 /smooth medium\n'
+        '• Тонкие линии: /line 1 /linecolor light',
         parse_mode='HTML'
     )
 
@@ -354,8 +470,14 @@ def main() -> None:
     
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('settings', show_settings))
     application.add_handler(CommandHandler('colors', set_colors))
     application.add_handler(CommandHandler('detail', set_detail))
+    application.add_handler(CommandHandler('line', set_line_thickness))
+    application.add_handler(CommandHandler('linecolor', set_line_color))
+    application.add_handler(CommandHandler('font', set_font_size))
+    application.add_handler(CommandHandler('size', set_max_size))
+    application.add_handler(CommandHandler('smooth', set_smooth))
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
     
     logger.info('🎨 Бот запущен!')
