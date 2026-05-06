@@ -170,16 +170,24 @@ def get_pole_of_inaccessibility(mask: np.ndarray) -> Optional[Tuple[int, int]]:
         return None
     
     # Distance transform
-    dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_5)
-    _, _, _, max_loc = cv2.minMaxLoc(dist)
+    # Убедимся, что маска uint8
+    mask_uint8 = mask.astype(np.uint8)
+    dist = cv2.distanceTransform(mask_uint8, cv2.DIST_L2, cv2.DIST_MASK_5)
     
-    x, y = max_loc
+    # Находим максимум
+    _, max_val, _, max_loc = cv2.minMaxLoc(dist)
+    
+    if max_val <= 0:
+        return None
+        
+    x, y = max_loc  # OpenCV возвращает (x, y)
     h, w = mask.shape
     
-    # Проверка границ
+    # Строгая проверка границ
     if 0 <= x < w and 0 <= y < h:
         if mask[y, x]:
-            return (x, y)
+            return (int(x), int(y))
+            
     return None
 
 def segment_image_advanced(img_array: np.ndarray, config: PBNConfig) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int,int,int]]]:
@@ -285,7 +293,7 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
                       palette: List[Tuple[int,int,int]], 
                       min_area: int, target_regions: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int,int,int]]]:
     """
-    Быстрое слияние регионов. Исправлена ошибка выхода за границы массива.
+    Быстрое слияние регионов с полной проверкой границ.
     """
     if target_regions is None:
         target_regions = len(palette) * 4
@@ -300,9 +308,8 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
 
     # Предварительный расчет LAB цветов палитры
     try:
-        palette_lab = cv2.cvtColor(
-            np.uint8([[c for c in current_palette]]), cv2.COLOR_RGB2LAB
-        ).astype(np.float32).squeeze()
+        palette_array = np.uint8([[c for c in current_palette]])
+        palette_lab = cv2.cvtColor(palette_array, cv2.COLOR_RGB2LAB).astype(np.float32).squeeze()
         if palette_lab.ndim == 1:
             palette_lab = palette_lab.reshape(1, -1)
     except Exception as e:
@@ -319,6 +326,10 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
         next_region_id = 1
         
         for color_idx in unique_colors_in_use:
+            # Проверка: цвет должен быть в палитре
+            if color_idx < 0 or color_idx >= len(current_palette):
+                continue
+                
             mask = (current_labels == color_idx).astype(np.uint8)
             num, comps, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4, ltype=cv2.CV_32S)
             
@@ -327,15 +338,17 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
                 reg_id = next_region_id
                 region_mask = (comps == i)
                 
-                # Проверка границ перед записью
-                if region_mask.shape == (h, w):
-                    temp_label_map[region_mask] = reg_id
-                    region_info[reg_id] = {
-                        'color_idx': int(color_idx),
-                        'area': int(stats[i, cv2.CC_STAT_AREA]),
-                        'mask': region_mask
-                    }
-                    next_region_id += 1
+                # Проверка размеров маски
+                if region_mask.shape != (h, w):
+                    continue
+                    
+                temp_label_map[region_mask] = reg_id
+                region_info[reg_id] = {
+                    'color_idx': int(color_idx),
+                    'area': int(stats[i, cv2.CC_STAT_AREA]),
+                    'mask': region_mask
+                }
+                next_region_id += 1
 
         total_regions = len(region_info)
         if total_regions <= target_regions:
@@ -346,8 +359,14 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
         candidates = sorted_regions[:50] 
         
         for reg_id, info in candidates:
-            if reg_id not in region_info: continue # Регион мог быть слит ранее
-            if info['area'] > np.median([r['area'] for r in region_info.values()]) * 2:
+            if reg_id not in region_info: continue
+            
+            # Проверка площади
+            areas = [r['area'] for r in region_info.values()]
+            if not areas: break
+            median_area = np.median(areas)
+            
+            if info['area'] > median_area * 2:
                 continue
                 
             mask = info['mask']
@@ -359,29 +378,37 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
             
             # Безопасное получение соседей
             try:
+                # boundary имеет тот же размер, что и temp_label_map
                 neighbor_ids = np.unique(temp_label_map[boundary > 0])
-                neighbor_ids = neighbor_ids[neighbor_ids != reg_id]
-                neighbor_ids = neighbor_ids[neighbor_ids != 0] # Убираем фон
-            except IndexError:
+                # Фильтруем: убираем себя, фон (0) и несуществующие ID
+                neighbor_ids = [nid for nid in neighbor_ids if nid != reg_id and nid != 0 and nid in region_info]
+            except Exception:
                 continue
                 
-            if len(neighbor_ids) == 0: continue
+            if not neighbor_ids: continue
             
-            current_lab = palette_lab[info['color_idx']]
+            current_color_idx = info['color_idx']
+            # Проверка границ палитры для текущего цвета
+            if current_color_idx >= len(palette_lab):
+                continue
+            current_lab = palette_lab[current_color_idx]
+            
             best_neighbor_id = None
             min_dist = float('inf')
             
             for nb_id in neighbor_ids:
-                if nb_id not in region_info: continue
-                nb_color_idx = region_info[nb_id]['color_idx']
+                nb_info = region_info[nb_id]
+                nb_color_idx = nb_info['color_idx']
                 
-                # Проверка границ палитры
-                if nb_color_idx >= len(palette_lab) or info['color_idx'] >= len(palette_lab):
+                # Проверка границ палитры для соседа
+                if nb_color_idx >= len(palette_lab):
                     continue
                     
                 nb_lab = palette_lab[nb_color_idx]
                 dist = np.linalg.norm(current_lab - nb_lab)
-                score = dist / (region_info[nb_id]['area'] + 1)
+                
+                # Эвристика
+                score = dist / (nb_info['area'] + 1)
                 
                 if score < min_dist:
                     min_dist = score
@@ -390,13 +417,13 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
             if best_neighbor_id is not None:
                 target_color_idx = region_info[best_neighbor_id]['color_idx']
                 
-                # Обновляем карты
-                current_labels[mask] = target_color_idx
-                current_quantized[mask] = current_palette[target_color_idx]
-                
-                # Удаляем слитый регион
-                del region_info[reg_id]
-                merged_count += 1
+                # Проверка границ палитры перед записью
+                if target_color_idx < len(current_palette):
+                    current_labels[mask] = target_color_idx
+                    current_quantized[mask] = current_palette[target_color_idx]
+                    
+                    del region_info[reg_id]
+                    merged_count += 1
 
         if merged_count == 0: break
             
@@ -404,15 +431,6 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
     final_unique_colors = np.unique(current_quantized.reshape(-1, 3), axis=0)
     final_palette = [tuple(c) for c in final_unique_colors]
     
-    final_label_map = np.zeros((h, w), dtype=np.int32)
-    for new_idx, color in enumerate(final_palette):
-        mask = np.all(current_quantized == color, axis=2)
-        final_label_map[mask] = new_idx
-        
-    return current_quantized, final_label_map, final_palette
-            
-    final_unique_colors = np.unique(current_quantized.reshape(-1, 3), axis=0)
-    final_palette = [tuple(c) for c in final_unique_colors]
     final_label_map = np.zeros((h, w), dtype=np.int32)
     for new_idx, color in enumerate(final_palette):
         mask = np.all(current_quantized == color, axis=2)
