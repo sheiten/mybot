@@ -224,30 +224,33 @@ def preprocess_image(image: Image.Image, target_size: int,
 
 def cluster_colors(img_array: np.ndarray, config: PBNConfig) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int, int, int]]]:
     """
-    Cluster colors using KMeans in LAB or RGB space with optional spatial weighting.
-    Returns: (quantized_image, label_map, palette_colors_rgb)
+    УЛУЧШЕННАЯ версия: LAB + пост-обработка + очистка артефактов
     """
     h, w = img_array.shape[:2]
     total_pixels = h * w
     
-    # Choose color space
+    # 🔹 Предварительное сглаживание для лучшего кластеринга
+    img_smooth = cv2.bilateralFilter(img_array, d=7, sigmaColor=50, sigmaSpace=50)
+    
+    # Цветовое пространство
     if config.color_space == 'lab':
-        img_processed = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB).astype(np.float32)
+        img_processed = cv2.cvtColor(img_smooth, cv2.COLOR_RGB2LAB).astype(np.float32)
+        # L: 0-100, a/b: -128..127 → нормализуем для KMeans
+        img_processed[:, :, 0] /= 100.0
+        img_processed[:, :, 1:] = (img_processed[:, :, 1:] + 128) / 255.0
         convert_back = lambda centers: cv2.cvtColor(
-            centers.astype(np.uint8).reshape(-1, 1, 3), 
+            np.clip(centers * [100, 255, 255] + [0, -128, -128], 0, 255).astype(np.uint8).reshape(-1, 1, 3),
             cv2.COLOR_LAB2RGB
         ).reshape(-1, 3)
     else:
-        img_processed = img_array.astype(np.float32)
-        convert_back = lambda centers: centers
+        img_processed = img_smooth.astype(np.float32) / 255.0
+        convert_back = lambda centers: np.clip(centers * 255, 0, 255).astype(np.uint8)
     
-    # Prepare features: [color_channels, optional_spatial]
+    # Фичи: цвет + опционально координаты
     if config.spatial_weight > 0:
-        # Normalized coordinates
         y_coords, x_coords = np.mgrid[0:h, 0:w]
         x_norm = (x_coords / w).astype(np.float32) * config.spatial_weight
         y_norm = (y_coords / h).astype(np.float32) * config.spatial_weight
-        
         features = np.stack([
             img_processed[:, :, 0].ravel(),
             img_processed[:, :, 1].ravel(),
@@ -260,49 +263,33 @@ def cluster_colors(img_array: np.ndarray, config: PBNConfig) -> Tuple[np.ndarray
         features = img_processed.reshape(-1, 3)
         color_dims = 3
     
-    # Choose clustering algorithm based on image size
+    # Кластеризация
     use_minibatch = config.use_minibatch and total_pixels > 300_000
-    
     if use_minibatch:
-        # Sample for MiniBatchKMeans fitting
         sample_size = min(50_000, total_pixels)
-        sample_indices = np.random.choice(total_pixels, sample_size, replace=False)
-        sample_features = features[sample_indices]
-        
-        kmeans = MiniBatchKMeans(
-            n_clusters=config.n_colors,
-            batch_size=1000,
-            random_state=42,
-            n_init=3,
-            max_iter=100
-        )
-        kmeans.fit(sample_features)
+        sample_idx = np.random.choice(total_pixels, sample_size, replace=False)
+        kmeans = MiniBatchKMeans(n_clusters=config.n_colors, batch_size=1000, random_state=42, n_init=3)
+        kmeans.fit(features[sample_idx])
         labels = kmeans.predict(features).reshape(h, w)
     else:
-        # Full KMeans for smaller images
-        kmeans = KMeans(
-            n_clusters=config.n_colors,
-            random_state=42,
-            n_init=10,
-            max_iter=300
-        )
+        kmeans = KMeans(n_clusters=config.n_colors, random_state=42, n_init=10, max_iter=300)
         labels = kmeans.fit_predict(features).reshape(h, w)
     
-    # Extract and convert centers to RGB
-    centers = kmeans.cluster_centers_[:, :color_dims]  # Only color dimensions
+    # Палитра → сортировка по яркости
+    centers = kmeans.cluster_centers_[:, :color_dims]
     centers_rgb = convert_back(centers).astype(np.uint8)
-    
-    # Sort palette by brightness for intuitive numbering
     brightness = 0.299 * centers_rgb[:, 0] + 0.587 * centers_rgb[:, 1] + 0.114 * centers_rgb[:, 2]
-    sorted_indices = np.argsort(brightness)
+    sorted_idx = np.argsort(brightness)
     
-    # Remap labels to sorted order
-    label_map = {old: new for new, old in enumerate(sorted_indices)}
-    labels = np.vectorize(label_map.get)(labels)
-    centers_rgb = centers_rgb[sorted_indices]
+    # Ремаппинг лейблов
+    label_map = {old: new for new, old in enumerate(sorted_idx)}
+    labels = np.vectorize(lambda x: label_map.get(x, x))(labels)
+    centers_rgb = centers_rgb[sorted_idx]
     
-    # Reconstruct quantized image
+    # Реконструкция + пост-обработка (медианный фильтр для устранения шума)
     quantized = centers_rgb[labels]
+    for c in range(3):
+        quantized[:, :, c] = cv2.medianBlur(quantized[:, :, c], 3)
     
     return quantized, labels, [tuple(c) for c in centers_rgb]
 
@@ -315,56 +302,150 @@ def merge_small_regions(quantized: np.ndarray, labels: np.ndarray,
                        palette: List[Tuple[int, int, int]], 
                        min_area: int) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Merge regions smaller than min_area with their most similar neighbor.
-    Returns: (cleaned_quantized, cleaned_labels)
+    УЛУЧШЕННАЯ версия: итеративное слияние с эвристикой цвет+размер
     """
     h, w = quantized.shape[:2]
     new_labels = labels.copy()
     new_quantized = quantized.copy()
     
-    # Process each color channel separately for connected components
-    for color_idx, color in enumerate(palette):
+    # 🔹 Шаг 1: Удаление очень мелких компонент (connected components)
+    for color_idx in range(len(palette)):
         color_mask = (labels == color_idx).astype(np.uint8)
+        num, comp_labels, stats, _ = cv2.connectedComponentsWithStats(
+            color_mask, connectivity=4, ltype=cv2.CV_32S)
         
-        # Morphological cleanup
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
-        
-        # Find connected components
-        num_labels, comp_labels, stats, _ = cv2.connectedComponentsWithStats(
-            color_mask, connectivity=8, ltype=cv2.CV_32S
-        )
-        
-        for comp_id in range(1, num_labels):  # Skip background (0)
-            area = stats[comp_id, cv2.CC_STAT_AREA]
-            
-            if area < min_area:
-                # Create mask for this small component
+        for comp_id in range(1, num):
+            if stats[comp_id, cv2.CC_STAT_AREA] < min_area // 2:  # агрессивнее для микро-шума
                 comp_mask = (comp_labels == comp_id)
-                
-                # Find boundary pixels (dilate - original)
+                # Найти соседей
                 kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
                 dilated = cv2.dilate(comp_mask.astype(np.uint8), kernel)
                 boundary = dilated - comp_mask.astype(np.uint8)
                 
                 if np.sum(boundary) > 0:
-                    # Get neighbor colors
-                    neighbor_colors = new_labels[boundary > 0]
-                    
-                    if len(neighbor_colors) > 0:
-                        # Find most frequent neighbor color
-                        neighbor_counts = np.bincount(neighbor_colors.flatten())
-                        dominant_neighbor = np.argmax(neighbor_counts)
-                        
-                        # Merge: assign to dominant neighbor
-                        new_labels[comp_mask] = dominant_neighbor
-                        new_quantized[comp_mask] = palette[dominant_neighbor]
+                    neighbor_labels = new_labels[boundary > 0]
+                    if len(neighbor_labels) > 0:
+                        # Самый частый сосед
+                        dominant = np.bincount(neighbor_labels.flatten()).argmax()
+                        new_labels[comp_mask] = dominant
+                        new_quantized[comp_mask] = palette[dominant]
+    
+    # 🔹 Шаг 2: Итеративное слияние до достижения разумного количества регионов
+    for iteration in range(3):  # максимум 3 итерации
+        # Подсчёт регионов
+        region_stats = []
+        for color_idx in range(len(palette)):
+            mask = (new_labels == color_idx).astype(np.uint8)
+            num, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+            for i in range(1, num):
+                if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                    region_stats.append({
+                        'color_idx': color_idx,
+                        'area': stats[i, cv2.CC_STAT_AREA],
+                        'comp_id': i,
+                        'mask': None  # ленивое вычисление
+                    })
+        
+        if len(region_stats) <= config.n_colors * 3:  # эвристика: не больше 3× цветов
+            break
+        
+        # Сортируем: маленькие регионы в приоритете
+        region_stats.sort(key=lambda x: x['area'])
+        
+        # Ищем пару для слияния (маленький + ближайший по цвету сосед)
+        merged = False
+        for region in region_stats[:20]:  # проверяем топ-20 самых мелких
+            if region['area'] > np.median([r['area'] for r in region_stats]) * 2:
+                continue
+            
+            # Получаем маску региона (лениво)
+            if region['mask'] is None:
+                color_mask = (new_labels == region['color_idx']).astype(np.uint8)
+                num, comp_labels, _, _ = cv2.connectedComponentsWithStats(
+                    color_mask, connectivity=4)
+                region['mask'] = (comp_labels == region['comp_id'])
+            
+            # Граница региона
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            dilated = cv2.dilate(region['mask'].astype(np.uint8), kernel)
+            boundary = dilated - region['mask'].astype(np.uint8)
+            
+            if np.sum(boundary) == 0:
+                continue
+            
+            # Соседние цвета
+            neighbor_colors = new_labels[boundary > 0]
+            if len(neighbor_colors) == 0:
+                continue
+            
+            # Выбираем соседа: частота + близость цвета (в LAB)
+            unique_neighbors, counts = np.unique(neighbor_colors, return_counts=True)
+            best_neighbor = None
+            best_score = float('inf')
+            
+            current_lab = cv2.cvtColor(
+                np.uint8([[palette[region['color_idx']]]]), cv2.COLOR_RGB2LAB
+            ).flatten().astype(np.float32)
+            
+            for nb_color, count in zip(unique_neighbors, counts):
+                nb_lab = cv2.cvtColor(
+                    np.uint8([[palette[nb_color]]]), cv2.COLOR_RGB2LAB
+                ).flatten().astype(np.float32)
+                color_dist = np.linalg.norm(current_lab - nb_lab)
+                # Скор: маленькая площадь × расстояние / частота
+                score = region['area'] * color_dist / (count + 1)
+                
+                if score < best_score:
+                    best_score = score
+                    best_neighbor = nb_color
+            
+            if best_neighbor is not None:
+                # Выполняем слияние
+                new_labels[region['mask']] = best_neighbor
+                new_quantized[region['mask']] = palette[best_neighbor]
+                merged = True
+                break  # одна операция за итерацию для стабильности
+        
+        if not merged:
+            break
     
     return new_quantized, new_labels
-
+                           
+def remove_thin_regions(quantized: np.ndarray, min_length: int = 7, iterations: int = 3) -> np.ndarray:
+    """
+    Удаление тонких регионов сканированием по строкам/столбцам (Axecrafted approach)
+    """
+    result = quantized.copy()
+    h, w = result.shape[:2]
+    
+    for _ in range(iterations):
+        for transpose in [False, True]:  # horizontal → vertical
+            if transpose:
+                result = result.transpose(1, 0, 2)
+                h, w = w, h
+            
+            for row in range(h):
+                line = result[row]
+                # Находим границы цветовых переходов
+                transitions = np.any(line[:-1] != line[1:], axis=1)
+                boundaries = np.where(transitions)[0] + 1
+                boundaries = np.concatenate([[0], boundaries, [w]])
+                
+                # Обрабатываем каждый сегмент
+                for i in range(1, len(boundaries) - 1):  # пропускаем крайние
+                    start, end = boundaries[i], boundaries[i+1]
+                    length = end - start
+                    if length < min_length:
+                        # Выбираем цвет БОЛЬШЕГО соседа
+                        left_len = start - boundaries[i-1]
+                        right_len = boundaries[i+2] - end if i+2 < len(boundaries) else 0
+                        fill_color = line[start-1] if left_len >= right_len else line[end]
+                        result[row, start:end] = fill_color
+            
+            if transpose:
+                result = result.transpose(1, 0, 2)  # обратно
+    
+    return result
 
 # ============================================
 # SMART NUMBER PLACEMENT
@@ -498,9 +579,7 @@ def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int, int, int
 def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, int, int]], 
                                config: PBNConfig) -> io.BytesIO:
     """
-    FIXED VERSION:
-    • Single contours at color boundaries (no duplicates)
-    • Numbers in ALL regions (relaxed checks)
+    УЛУЧШЕННАЯ версия: единая карта границ + pole-of-inaccessibility для меток
     """
     h, w = quantized.shape[:2]
     line_rgb = config.line_rgb
@@ -522,100 +601,88 @@ def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int, 
             pass
         return max(1, font_size * len(text) // 2), max(1, font_size)
     
-    # 🔹 STEP 1: Create label map (each pixel gets color number)
+    # 🔹 STEP 1: Label map (color → number)
     label_map = np.zeros((h, w), dtype=np.int32)
     for color_idx, color in enumerate(palette):
         mask = np.all(quantized == color, axis=2)
-        label_map[mask] = color_idx + 1  # +1 so 0 is background
+        label_map[mask] = color_idx + 1
     
-    # 🔹 STEP 2: Find BOUNDARIES between regions (where neighbors differ)
-    gradient_x = np.abs(np.diff(label_map, axis=1))
-    gradient_y = np.abs(np.diff(label_map, axis=0))
+    # 🔹 STEP 2: Единая карта границ (где соседи отличаются)
+    grad_x = np.abs(np.diff(label_map, axis=1, prepend=label_map[:, :1]))
+    grad_y = np.abs(np.diff(label_map, axis=0, prepend=label_map[:1, :]))
+    boundary_mask = ((grad_x > 0) | (grad_y > 0)).astype(np.uint8)
     
-    # Create boundary mask
-    boundary_mask = np.zeros((h, w), dtype=np.uint8)
-    boundary_mask[:-1, :] |= (gradient_y > 0)  # horizontal boundaries
-    boundary_mask[:, :-1] |= (gradient_x > 0)  # vertical boundaries
-    
-    # Morphology to thicken lines
+    # Утолщение линий
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     boundary_mask = cv2.dilate(boundary_mask, kernel, iterations=config.line_thickness)
     
-    # 🔹 STEP 3: Find contours on unified boundary map
+    # 🔹 STEP 3: Контуры на единой карте границ (без дублей!)
     contours, _ = cv2.findContours(boundary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour_canvas = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(contour_canvas, contours, -1, 255, thickness=1)
+    canvas[contour_canvas > 0] = line_rgb
     
-    # Draw ALL contours at once (single lines!)
-    contour_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(contour_mask, contours, -1, 255, thickness=1)
-    
-    # Apply color
-    canvas[contour_mask > 0] = line_rgb
-    
-    # 🔹 STEP 4: Find regions for number placement
-    # Use ORIGINAL color masks (not boundaries!)
+    # 🔹 STEP 4: Размещение номеров через pole-of-inaccessibility
     placed_positions = []
     regions_with_numbers = 0
     
     for color_idx, color in enumerate(palette):
         color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
         
-        # Morphology for cleanup
+        # Очистка маски
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        # Find connected components INSIDE this color area
-        num_labels, labels_img, stats, _ = cv2.connectedComponentsWithStats(
-            color_mask, connectivity=8, ltype=cv2.CV_32S
-        )
+        # Connected components внутри цвета
+        num, labels_img, stats, _ = cv2.connectedComponentsWithStats(
+            color_mask, connectivity=4, ltype=cv2.CV_32S)
         
-        for comp_id in range(1, num_labels):  # skip background (0)
+        for comp_id in range(1, num):
             area = stats[comp_id, cv2.CC_STAT_AREA]
-            
-            # Skip too small
             if area < config.min_region_size:
                 continue
             
-            # Create mask for this component
-            comp_mask = (labels_img == comp_id).astype(np.uint8) * 255
+            comp_mask = (labels_img == comp_id).astype(np.uint8)
             
-            # Find contour for position check
-            comp_contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not comp_contours:
-                continue
+            # 🔥 Pole of inaccessibility: точка, максимально удалённая от границы
+            dist_transform = cv2.distanceTransform(comp_mask, cv2.DIST_L2, cv2.DIST_MASK_5)
+            _, _, _, max_loc = cv2.minMaxLoc(dist_transform)
+            cx, cy = max_loc  # (x, y)
             
-            contour = max(comp_contours, key=cv2.contourArea)
+            # Проверка наложения (менее строгая)
+            collision = False
+            for px, py in placed_positions:
+                if math.hypot(cx - px, cy - py) < font_size * 2.5:
+                    collision = True
+                    break
             
-            # SIMPLIFIED number position search
-            pos = find_number_position_simple(contour, comp_mask, font_size, 
-                                             placed_positions, min_dist=font_size*2.0)
+            if collision:
+                continue  # пропускаем, чтобы не накладывать
             
-            if pos:
-                cx, cy = pos
-                num_str = str(color_idx + 1)
-                text_w, text_h = safe_text_size(num_str, font)
-                
-                # White background
-                padding = 2
-                x1 = max(0, cx - text_w//2 - padding)
-                y1 = max(0, cy - text_h//2 - padding)
-                x2 = min(w, cx + text_w//2 + padding)
-                y2 = min(h, cy + text_h//2 + padding)
-                
-                cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
-                
-                # Number
-                pil_img = Image.fromarray(canvas)
-                draw = ImageDraw.Draw(pil_img)
-                draw.text((cx - text_w//2, cy - text_h//2 + 1), num_str, 
-                         fill='black', font=font)
-                canvas = np.array(pil_img)
-                
-                placed_positions.append((cx, cy))
-                regions_with_numbers += 1
+            num_str = str(color_idx + 1)
+            text_w, text_h = safe_text_size(num_str, font)
+            
+            # Белый фон под номером
+            padding = 3
+            x1 = max(0, cx - text_w//2 - padding)
+            y1 = max(0, cy - text_h//2 - padding)
+            x2 = min(w, cx + text_w//2 + padding)
+            y2 = min(h, cy + text_h//2 + padding)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+            
+            # Номер
+            pil_img = Image.fromarray(canvas)
+            draw = ImageDraw.Draw(pil_img)
+            draw.text((cx - text_w//2, cy - text_h//2 + 1), num_str, 
+                     fill='black', font=font)
+            canvas = np.array(pil_img)
+            
+            placed_positions.append((cx, cy))
+            regions_with_numbers += 1
     
     logger.info(f"✅ Placed {regions_with_numbers} numbers in {len(palette)} colors")
     
-    # Save
+    # Сохранение
     output = io.BytesIO()
     Image.fromarray(canvas).save(output, format='PNG', dpi=(300, 300))
     output.seek(0)
@@ -677,7 +744,7 @@ def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[i
     
     # Merge small regions
     quantized, labels = merge_small_regions(quantized, labels, palette, config.min_region_size)
-    
+    quantized = remove_thin_regions(quantized, min_length=7, iterations=3)
     # Generate outputs
     coloring_buffer = create_coloring_page_raster(quantized, palette, config)
     
