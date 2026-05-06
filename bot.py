@@ -268,56 +268,36 @@ def segment_image_advanced(img_array: np.ndarray, config: PBNConfig) -> Tuple[np
 def remove_thin_regions_scan(quantized: np.ndarray, min_length: int = 7, iterations: int = 3) -> np.ndarray:
     result = quantized.copy()
     h, w = result.shape[:2]
-    
     for _ in range(iterations):
         for transpose in [False, True]:
             if transpose:
                 result = result.transpose(1, 0, 2)
-                h, w = w, h
-            else:
-                h, w = result.shape[:2]
-            
+                h, w = result.shape[:2]  # ✅ ВАЖНО: обновляем h,w после транспонирования
             for row in range(h):
                 line = result[row]
                 transitions = np.any(line[:-1] != line[1:], axis=1)
                 boundaries = np.where(transitions)[0] + 1
                 boundaries = np.concatenate([[0], boundaries, [w]])
-                
                 for i in range(1, len(boundaries) - 1):
                     start, end = boundaries[i], boundaries[i+1]
-                    
                     if end - start < min_length:
-                        # Длина сегмента слева
-                        left_len = start - boundaries[i - 1]
-                        
-                        # Длина сегмента справа
+                        left_len = start - boundaries[i-1]
                         if i + 2 < len(boundaries):
-                            right_len = boundaries[i + 2] - end
+                            right_len = boundaries[i+2] - end
                         else:
                             right_len = 0
                         
-                        # Безопасное получение цветов с проверкой границ
+                        # ✅ ИСПРАВЛЕНИЕ: безопасный доступ к индексам
                         left_color = line[max(0, start - 1)]
+                        right_idx = min(end, w - 1)
+                        right_color = line[right_idx]
                         
-                        right_index = min(end, w - 1)
-                        right_color = line[right_index]
-                        
-                        # Выбираем цвет от более длинного соседа
                         fill_color = left_color if left_len >= right_len else right_color
-                        
-                        # Заполняем тонкий сегмент
                         result[row, start:end] = fill_color
-            
             if transpose:
                 result = result.transpose(1, 0, 2)
-                h, w = result.shape[:2]
-    
-    # Финальная синхронизация размеров
-    if result.shape[:2] != quantized.shape[:2]:
-        result = cv2.resize(result, (quantized.shape[1], quantized.shape[0]), interpolation=cv2.INTER_NEAREST)
-    
+                h, w = result.shape[:2]  # ✅ ВАЖНО: обновляем h,w после обратного транспонирования
     return result
-
 def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray, 
                       palette: List[Tuple[int,int,int]], 
                       min_area: int, target_regions: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int,int,int]]]:
