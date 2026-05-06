@@ -565,8 +565,8 @@ def create_coloring_page_raster(
    return output
     
 def safe_text_size(text: str, font_obj) -> Tuple[int, int]:
-        try:
-            if hasattr(font_obj, 'getbbox'):
+    try:
+        if hasattr(font_obj, 'getbbox'):
                 bbox = font_obj.getbbox(text)
                 return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
             elif hasattr(font_obj, 'getsize'):
