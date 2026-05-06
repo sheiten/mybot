@@ -1,7 +1,12 @@
+# Telegram Bot Core
 python-telegram-bot>=20.0
-numpy==1.26.4
-pillow>=9.0.0
-scikit-learn>=1.2.0
-scikit-image>=0.19.0
-opencv-contrib-python-headless>=4.7.0
-svgwrite>=1.4.3
+
+# Image Processing & Math
+numpy>=1.24.0,<2.0.0       # Совместимость с sklearn/skimage, но не ломающая v2.0
+pillow>=9.0.0              # Работа с изображениями и шрифтами
+scikit-learn>=1.2.0        # KMeans, MeanShift
+scikit-image>=0.19.0       # SLIC, RAG, морфология (ключевая для нового алгоритма)
+opencv-contrib-python-headless>=4.7.0  # CV алгоритмы (без GUI зависимостей)
+
+# SVG Export
+svgwrite>=1.4.3            # Генерация векторных раскрасок
