@@ -188,7 +188,7 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
             placed_positions.append((cx, cy))
     
     output = io.BytesIO()
-    dwg.write(output, encoding='utf-8')
+    dwg.write(output)
     output.seek(0)
     return output
 
