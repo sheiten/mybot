@@ -187,10 +187,14 @@ def create_coloring_page_vector(quantized: np.ndarray, palette: List[Tuple[int, 
             ))
             placed_positions.append((cx, cy))
     
-    output = io.BytesIO()
+    # 👇 ИСПРАВЛЕНИЕ: используем StringIO, а не BytesIO
+    output = io.StringIO()
     dwg.write(output)
-    output.seek(0)
-    return output
+    svg_string = output.getvalue()
+    output.close()
+    
+    # Конвертируем строку в байты для Telegram
+    return io.BytesIO(svg_string.encode('utf-8'))
 
 def create_palette_image(palette: List[Tuple[int, int, int]]) -> Image.Image:
     """Палитра"""
