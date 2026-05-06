@@ -1,50 +1,145 @@
-import numpy as np
-import cv2
-from PIL import Image, ImageDraw, ImageFont
-from skimage.segmentation import slic, mark_boundaries
-from scipy import ndimage as ndi
-from typing import List, Tuple, Optional, Dict
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+🎨 Paint by Numbers Bot v4.0 (Hybrid Algorithm)
+Telegram bot for generating paint-by-number coloring pages.
+Uses SLIC + Mean Shift + Custom RAG Merging.
+"""
+
+import asyncio
+import logging
+import os
 import io
 import math
-import logging
+import ssl
+import urllib.request
+import json
+import sys
+import traceback
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict, Union
+from pathlib import Path
 
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from sklearn.cluster import KMeans, MiniBatchKMeans, MeanShift, estimate_bandwidth
+from skimage.segmentation import slic
+import cv2
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# ============================================
+# GLOBAL EXCEPTION HANDLER (Для отладки в Docker)
+# ============================================
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    print("💥 FATAL ERROR STARTING BOT:", file=sys.stderr)
+    traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
+
+sys.excepthook = global_exception_handler
+
+# ============================================
+# CONFIGURATION & CONSTANTS
+# ============================================
+
+TOKEN = os.environ.get('BOT_TOKEN', '')
+if not TOKEN:
+    raise ValueError('BOT_TOKEN environment variable is not set!')
+
+PORTAINER_WEBHOOK_URL = os.environ.get('PORTAINER_WEBHOOK_URL', '')
+PORTAINER_TOKEN = os.environ.get('PORTAINER_TOKEN', '')
+ADMIN_ID = int(os.environ.get('ADMIN_USER_ID', '931848809'))
+
+DEFAULT_CONFIG = {
+    'n_colors': 16,           # Оптимально для нового алгоритма
+    'min_region_size': 180,   # Чуть больше для чистоты
+    'max_image_size': 1200,   # Баланс скорости/качества
+    'line_thickness': 1,
+    'line_color': 'gray',
+    'font_size': 12,
+    'preprocess_strength': 'medium',
+    'color_space': 'lab',
+    'spatial_weight': 0.12,
+    'use_minibatch': True,
+    'export_svg': False,
+}
+
+LINE_COLORS = {
+    'gray': (180, 180, 180),
+    'dark': (100, 100, 100),
+    'light': (210, 210, 210),
+    'black': (0, 0, 0),
+}
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('pbn_bot.log', encoding='utf-8')
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
 # ============================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# DATA CLASSES
 # ============================================
 
-def rgb2lab_batch(rgb: np.ndarray) -> np.ndarray:
-    """Быстрая конвертация RGB→LAB для массивов"""
-    return cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-
-
-def lab2rgb_batch(lab: np.ndarray) -> np.ndarray:
-    """Обратная конвертация"""
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
-
-
-def get_pole_of_inaccessibility(mask: np.ndarray) -> Optional[Tuple[int, int]]:
-    """Нахождение точки, максимально удалённой от границы региона"""
-    if not np.any(mask):
-        return None
+@dataclass
+class PBNConfig:
+    n_colors: int = 16
+    min_region_size: int = 180
+    max_image_size: int = 1200
+    line_thickness: int = 1
+    line_color: str = 'gray'
+    font_size: int = 12
+    preprocess_strength: str = 'medium'
+    color_space: str = 'lab'
+    spatial_weight: float = 0.12
+    use_minibatch: bool = True
+    export_svg: bool = False
     
-    # Distance transform
-    dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_5)
-    _, _, _, max_loc = cv2.minMaxLoc(dist)
+    @property
+    def line_rgb(self) -> Tuple[int, int, int]:
+        return LINE_COLORS.get(self.line_color, LINE_COLORS['gray'])
     
-    # Проверка: точка должна быть внутри маски
-    if mask[max_loc[1], max_loc[0]]:
-        return max_loc  # (x, y)
-    return None
+    @classmethod
+    def from_dict(cls, data: dict) -> 'PBNConfig':
+        valid_keys = cls.__annotations__.keys()
+        return cls(**{k: v for k, v in data.items() if k in valid_keys})
+    
+    @classmethod
+    def from_user_data(cls, user_data: dict) -> 'PBNConfig':
+        return cls.from_dict(user_data)
 
 
-def safe_get_font(size: int):
-    """Безопасная загрузка шрифта (из вашего бота)"""
+# ============================================
+# UTILS & SECURITY
+# ============================================
+
+def trigger_self_update() -> bool:
+    if not PORTAINER_WEBHOOK_URL or not PORTAINER_TOKEN:
+        return False
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(
+            PORTAINER_WEBHOOK_URL, method='POST',
+            headers={'Authorization': f'Bearer {PORTAINER_TOKEN}', 'Content-Type': 'application/json'},
+            data=json.dumps({'action': 'redeploy'}).encode('utf-8')
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+            return response.status in (200, 204)
+    except Exception as e:
+        logger.error(f"Update webhook error: {e}")
+        return False
+
+def get_font(size: int) -> ImageFont.FreeTypeFont:
     font_candidates = [
-        "C:/Windows/Fonts/arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
         "Arial.ttf", "arial.ttf", "DejaVuSans.ttf",
     ]
@@ -60,116 +155,81 @@ def safe_get_font(size: int):
 
 
 # ============================================
-# 🔄 ЗАМЕНА: cluster_colors() → segment_image_advanced()
+# 🎨 ADVANCED GENERATOR ENGINE (Встроено)
 # ============================================
 
-def segment_image_advanced(img_array: np.ndarray, config) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int,int,int]]]:
-    """
-    ГИБРИДНЫЙ АЛГОРИТМ сегментации:
-    1. SLIC superpixels → пространственная когерентность
-    2. Mean Shift в LAB → адаптивное квантование цветов
-    3. Пост-обработка → очистка артефактов
-    
-    Returns: (quantized_image, segment_labels, palette_rgb)
-    """
+def rgb2lab_batch(rgb: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+
+def lab2rgb_batch(lab: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+def get_pole_of_inaccessibility(mask: np.ndarray) -> Optional[Tuple[int, int]]:
+    if not np.any(mask):
+        return None
+    dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_5)
+    _, _, _, max_loc = cv2.minMaxLoc(dist)
+    if mask[max_loc[1], max_loc[0]]:
+        return max_loc
+    return None
+
+def segment_image_advanced(img_array: np.ndarray, config: PBNConfig) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int,int,int]]]:
     h, w = img_array.shape[:2]
-    
-    # 🔹 Шаг 1: Предобработка
-    # Bilateral filter для сохранения границ при сглаживании
     img_smooth = cv2.bilateralFilter(img_array, d=9, sigmaColor=75, sigmaSpace=75)
-    
-    # Конвертация в LAB для лучшего восприятия цвета
     img_lab = cv2.cvtColor(img_smooth, cv2.COLOR_RGB2LAB).astype(np.float32)
-    # Нормализация: L∈[0,100], a,b∈[0,255]
     img_lab[:, :, 0] /= 100.0
     img_lab[:, :, 1:] /= 255.0
     
-    # 🔹 Шаг 2: SLIC Superpixels (пространственная сегментация)
-    # n_segments ≈ желаемое количество регионов × коэффициент запаса
-    target_segments = min(config.n_colors * 8, 500)  # не больше 500 для скорости
-    compactness = 20.0  # баланс цвет/пространство
+    target_segments = min(config.n_colors * 8, 500)
+    segments = slic(img_lab, n_segments=target_segments, compactness=20.0, sigma=2.0, start_label=1, enforce_connectivity=True)
     
-    segments = slic(
-        img_lab, 
-        n_segments=target_segments, 
-        compactness=compactness,
-        sigma=2.0,  # дополнительное сглаживание перед сегментацией
-        start_label=1,  # 0 зарезервирован для фона
-        enforce_connectivity=True,
-        max_num_iter=10
-    )
-    
-    # 🔹 Шаг 3: Адаптивное квантование цветов через Mean Shift
-    # Собираем средний цвет каждого суперпикселя в LAB
     segment_colors_lab = []
-    for seg_id in np.unique(segments):
+    unique_segs = np.unique(segments)
+    for seg_id in unique_segs:
+        if seg_id == 0: continue
         mask = (segments == seg_id)
-        if np.sum(mask) < 10:  # пропускаем микро-сегменты
-            continue
-        mean_color = np.mean(img_lab[mask], axis=0)
-        segment_colors_lab.append(mean_color)
+        if np.sum(mask) < 10: continue
+        segment_colors_lab.append(np.mean(img_lab[mask], axis=0))
     
     if len(segment_colors_lab) == 0:
-        # Fallback: простой K-Means если Mean Shift не сработал
-        from sklearn.cluster import KMeans
         pixels = img_lab.reshape(-1, 3)
         kmeans = KMeans(n_clusters=config.n_colors, random_state=42, n_init=5)
         labels_flat = kmeans.fit_predict(pixels)
         centers_lab = kmeans.cluster_centers_
         quantized_lab = centers_lab[labels_flat].reshape(h, w, 3)
     else:
-        # Mean Shift: автоматически определяет количество кластеров
-        from sklearn.cluster import MeanShift, estimate_bandwidth
-        
         colors_array = np.array(segment_colors_lab)
-        
-        # Оценка bandwidth: квантиль попарных расстояний
         if len(colors_array) > 100:
             sample_idx = np.random.choice(len(colors_array), 100, replace=False)
             bandwidth = estimate_bandwidth(colors_array[sample_idx], quantile=0.3, n_samples=50)
         else:
             bandwidth = estimate_bandwidth(colors_array, quantile=0.3)
         
-        # Mean Shift кластеризация
         ms = MeanShift(bandwidth=bandwidth, bin_seeding=True, min_bin_freq=2)
         ms.fit(colors_array)
         cluster_centers_lab = ms.cluster_centers_
-        
-        # Маппинг суперпикселей → кластеры
         segment_to_cluster = ms.predict(colors_array)
         
-        # Построение квантизованного изображения
         quantized_lab = np.zeros_like(img_lab)
-        for seg_id in np.unique(segments):
-            if seg_id == 0:
-                continue
+        valid_seg_ids = [s for s in unique_segs if s != 0]
+        for i, seg_id in enumerate(valid_seg_ids):
+            if i >= len(segment_to_cluster): break
             mask = (segments == seg_id)
-            # Находим индекс суперпикселя в colors_array
-            idx = np.where(np.array([s for s in np.unique(segments) if s != 0]) == seg_id)[0]
-            if len(idx) > 0 and idx[0] < len(segment_to_cluster):
-                cluster_idx = segment_to_cluster[idx[0]]
-                quantized_lab[mask] = cluster_centers_lab[cluster_idx]
-    
-    # 🔹 Шаг 4: Обратная конвертация + пост-обработка
+            cluster_idx = segment_to_cluster[i]
+            quantized_lab[mask] = cluster_centers_lab[cluster_idx]
+
     quantized_lab[:, :, 0] *= 100.0
     quantized_lab[:, :, 1:] *= 255.0
     quantized_rgb = lab2rgb_batch(quantized_lab).astype(np.uint8)
     
-    # Медианный фильтр для устранения шума на границах
     for c in range(3):
         quantized_rgb[:, :, c] = cv2.medianBlur(quantized_rgb[:, :, c], 3)
     
-    # 🔹 Шаг 5: Извлечение палитры и маппинг
     unique_colors = np.unique(quantized_rgb.reshape(-1, 3), axis=0)
-    
-    # Ограничиваем палитру до config.n_colors через дополнительное слияние
     if len(unique_colors) > config.n_colors:
-        from sklearn.cluster import KMeans
         kmeans = KMeans(n_clusters=config.n_colors, random_state=42, n_init=3)
         kmeans.fit(unique_colors.astype(np.float32))
         centers = kmeans.cluster_centers_.astype(np.uint8)
-        
-        # Перемаппинг пикселей к ближайшему центру
         flat = quantized_rgb.reshape(-1, 3).astype(np.float32)
         labels = kmeans.predict(flat)
         quantized_rgb = centers[labels].reshape(h, w, 3)
@@ -177,172 +237,93 @@ def segment_image_advanced(img_array: np.ndarray, config) -> Tuple[np.ndarray, n
     else:
         palette = [tuple(c) for c in unique_colors]
     
-    # Сортировка палитры по яркости для интуитивной нумерации
     brightness = [0.299*c[0] + 0.587*c[1] + 0.114*c[2] for c in palette]
     sorted_idx = np.argsort(brightness)
     palette = [palette[i] for i in sorted_idx]
     
-    # Создание label map: pixel → color_index
     label_map = np.zeros((h, w), dtype=np.int32)
     for new_idx, color in enumerate(palette):
         mask = np.all(quantized_rgb == color, axis=2)
         label_map[mask] = new_idx
-    
-    logger.info(f"🎨 Сегментация: {len(palette)} цветов, ~{len(np.unique(label_map))} регионов")
-    
+        
     return quantized_rgb, label_map, palette
 
-
-# ============================================
-# ✂️ НОВАЯ: remove_thin_regions_scan()
-# ============================================
-
 def remove_thin_regions_scan(quantized: np.ndarray, min_length: int = 7, iterations: int = 3) -> np.ndarray:
-    """
-    Удаление тонких регионов сканированием по строкам/столбцам (Axecrafted approach)
-    Эффективно убирает «нити», ветки, артефакты без сложных дескрипторов формы.
-    """
     result = quantized.copy()
     h, w = result.shape[:2]
-    
     for _ in range(iterations):
-        for transpose in [False, True]:  # horizontal → vertical
+        for transpose in [False, True]:
             if transpose:
                 result = result.transpose(1, 0, 2)
                 h, w = w, h
-            
             for row in range(h):
                 line = result[row]
-                # Находим границы цветовых переходов
                 transitions = np.any(line[:-1] != line[1:], axis=1)
                 boundaries = np.where(transitions)[0] + 1
                 boundaries = np.concatenate([[0], boundaries, [w]])
-                
-                # Обрабатываем внутренние сегменты
                 for i in range(1, len(boundaries) - 1):
                     start, end = boundaries[i], boundaries[i+1]
-                    length = end - start
-                    if length < min_length:
-                        # Выбираем цвет БОЛЬШЕГО соседа
+                    if end - start < min_length:
                         left_len = start - boundaries[i-1]
                         right_len = boundaries[i+2] - end if i+2 < len(boundaries) else 0
                         fill_color = line[start-1] if left_len >= right_len else line[end]
                         result[row, start:end] = fill_color
-            
             if transpose:
-                result = result.transpose(1, 0, 2)  # обратно
-    
+                result = result.transpose(1, 0, 2)
     return result
-
-
-# ============================================
-# 🔗 ЗАМЕНА: merge_small_regions() → merge_regions_rag()
-# ============================================
 
 def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray, 
                       palette: List[Tuple[int,int,int]], 
                       min_area: int, target_regions: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int,int,int]]]:
-    """
-    Быстрое слияние регионов без skimage.future.graph.
-    Алгоритм:
-    1. Находит все компоненты.
-    2. Строит карту смежности (кто с кем граничит).
-    3. Итеративно сливает самые мелкие регионы с наиболее похожим по цвету соседом.
-    """
     if target_regions is None:
         target_regions = len(palette) * 4
-
     h, w = quantized.shape[:2]
     current_labels = labels.copy()
     current_quantized = quantized.copy()
-    current_palette = list(palette) # Копируем, чтобы можно было менять индексы
+    current_palette = list(palette)
     
-    # Предварительный расчет LAB цветов палитры для быстрого сравнения
-    palette_lab = cv2.cvtColor(
-        np.uint8([[c for c in current_palette]]), cv2.COLOR_RGB2LAB
-    ).astype(np.float32).squeeze()
-    
-    # Если палитра пустая или один цвет, выходим
     if len(current_palette) <= 1:
         return current_quantized, current_labels, current_palette
 
-    max_iterations = 10
-    for iteration in range(max_iterations):
-        # 1. Получаем статистику текущих регионов
-        # Используем connectedComponents для каждого цвета отдельно, чтобы сохранить маппинг
-        all_regions = [] # list of (color_idx, comp_id, area, mask_bool_array)
-        
-        # Это может быть медленно, если делать для каждого пикселя, поэтому оптимизируем:
-        # Сначала найдем уникальные метки в label map? Нет, у нас label map - это индекс цвета.
-        # Нам нужно разделить связные области внутри одного цвета.
-        
+    palette_lab = cv2.cvtColor(np.uint8([[c for c in current_palette]]), cv2.COLOR_RGB2LAB).astype(np.float32).squeeze()
+    
+    for iteration in range(10):
         unique_colors_in_use = np.unique(current_labels)
-        
-        temp_label_map = np.zeros((h, w), dtype=np.int32) # Временная карта уникальных ID регионов
-        region_info = {} # id -> { 'color_idx': int, 'area': int, 'pixels': [(y,x)] }
+        temp_label_map = np.zeros((h, w), dtype=np.int32)
+        region_info = {}
         next_region_id = 1
         
         for color_idx in unique_colors_in_use:
-            if color_idx == -1: continue # skip background if any
             mask = (current_labels == color_idx).astype(np.uint8)
-            num, comps, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=4, ltype=cv2.CV_32S)
-            
-            for i in range(1, num): # 0 - фон
-                if stats[i, cv2.CC_STAT_AREA] < 5: continue # игнорируем микро-шум < 5px
+            num, comps, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4, ltype=cv2.CV_32S)
+            for i in range(1, num):
+                if stats[i, cv2.CC_STAT_AREA] < 5: continue
                 reg_id = next_region_id
                 region_mask = (comps == i)
                 temp_label_map[region_mask] = reg_id
-                
-                region_info[reg_id] = {
-                    'color_idx': int(color_idx),
-                    'area': int(stats[i, cv2.CC_STAT_AREA]),
-                    'mask': region_mask # сохраняем маску для быстрого доступа
-                }
+                region_info[reg_id] = {'color_idx': int(color_idx), 'area': int(stats[i, cv2.CC_STAT_AREA]), 'mask': region_mask}
                 next_region_id += 1
 
-        total_regions = len(region_info)
-        logger.debug(f"Iter {iteration}: {total_regions} regions found.")
-        
-        if total_regions <= target_regions:
+        if len(region_info) <= target_regions:
             break
             
-        # 2. Построение графа смежности (кто с кем граничит)
-        # Используем dilate на temp_label_map, чтобы найти границы
-        # Это быстрый способ найти соседей
-        neighbors_map = {rid: {} for rid in region_info.keys()} # rid -> {neighbor_rid: count_boundary_pixels}
-        
-        # Для каждого региона находим соседей
-        # Оптимизация: делаем это через свертку или морфологию на общей карте меток
-        # Но проще пройтись по мелким регионам
-        
-        # Сортируем регионы по площади (от маленьких к большим)
         sorted_regions = sorted(region_info.items(), key=lambda x: x[1]['area'])
-        
         merged_count = 0
-        # Берем топ-50 самых мелких регионов для попытки слияния за итерацию
         candidates = sorted_regions[:50] 
         
         for reg_id, info in candidates:
             if info['area'] > np.median([r['area'] for r in region_info.values()]) * 2:
-                continue # Не трогаем крупные, если они не стали мелкими после предыдущих слияний
-                
+                continue
             mask = info['mask']
-            # Находим границу
             kernel = np.ones((3,3), np.uint8)
             dilated = cv2.dilate(mask.astype(np.uint8), kernel)
             boundary = dilated - mask.astype(np.uint8)
+            if np.sum(boundary) == 0: continue
             
-            if np.sum(boundary) == 0:
-                continue
-                
-            # Смотрим, какие регионы находятся на границе
             neighbor_ids = np.unique(temp_label_map[boundary > 0])
-            neighbor_ids = neighbor_ids[neighbor_ids != reg_id] # убираем себя
+            neighbor_ids = neighbor_ids[neighbor_ids != reg_id]
+            if len(neighbor_ids) == 0: continue
             
-            if len(neighbor_ids) == 0:
-                continue
-                
-            # Выбираем лучшего соседа: минимальное расстояние в LAB
             current_lab = palette_lab[info['color_idx']]
             best_neighbor_id = None
             min_dist = float('inf')
@@ -352,69 +333,35 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
                 nb_color_idx = region_info[nb_id]['color_idx']
                 nb_lab = palette_lab[nb_color_idx]
                 dist = np.linalg.norm(current_lab - nb_lab)
-                
-                # Эвристика: предпочитаем соседей с большей площадью (чтобы не создавать новые мелкие)
-                # Score = ColorDist / Area_Neighbor
                 score = dist / (region_info[nb_id]['area'] + 1)
-                
                 if score < min_dist:
                     min_dist = score
                     best_neighbor_id = nb_id
             
             if best_neighbor_id is not None:
-                # Сливаем reg_id в best_neighbor_id
                 target_color_idx = region_info[best_neighbor_id]['color_idx']
-                
-                # Обновляем карты
                 current_labels[mask] = target_color_idx
                 current_quantized[mask] = current_palette[target_color_idx]
-                
-                # Обновляем temp_label_map (важно для следующей итерации внутри цикла, 
-                # но для простоты пересчитаем его на следующей внешней итерации)
-                
-                # Помечаем регион как удаленный
                 del region_info[reg_id]
                 merged_count += 1
 
-        if merged_count == 0:
-            break # Нечего больше сливать
+        if merged_count == 0: break
             
-    # Финальная очистка палитры (удаляем цвета, которые исчезли)
     final_unique_colors = np.unique(current_quantized.reshape(-1, 3), axis=0)
     final_palette = [tuple(c) for c in final_unique_colors]
-    
-    # Пересчет labels под новую палитру
     final_label_map = np.zeros((h, w), dtype=np.int32)
-    color_to_new_idx = {c: i for i, c in enumerate(final_palette)}
-    
-    # Это медленно делать по пиксельно, используем broadcasting или loop по цветам
-    # Так как цветов мало (<30), цикл ОК
     for new_idx, color in enumerate(final_palette):
         mask = np.all(current_quantized == color, axis=2)
         final_label_map[mask] = new_idx
         
-    logger.info(f"🔗 Merging complete. Final colors: {len(final_palette)}, Regions: ~{len(np.unique(final_label_map))}")
-    
     return current_quantized, final_label_map, final_palette
 
-# ============================================
-# ✏️ ЗАМЕНА: create_coloring_page_raster()
-# ============================================
-
-def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int,int,int]], 
-                               config) -> io.BytesIO:
-    """
-    Генерация PNG раскраски:
-    • Единая карта границ (без дублей)
-    • Pole of inaccessibility для номеров
-    • Проверка наложений
-    """
+def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int,int,int]], config: PBNConfig) -> io.BytesIO:
     h, w = quantized.shape[:2]
     line_rgb = config.line_rgb
     font_size = config.font_size
-    
     canvas = np.ones((h, w, 3), dtype=np.uint8) * 255
-    font = safe_get_font(font_size)
+    font = get_font(font_size)
     
     def safe_text_size(text: str, font_obj) -> Tuple[int, int]:
         try:
@@ -423,118 +370,9 @@ def create_coloring_page_raster(quantized: np.ndarray, palette: List[Tuple[int,i
                 return max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
             elif hasattr(font_obj, 'getsize'):
                 return font_obj.getsize(text)
-        except:
-            pass
+        except: pass
         return max(1, font_size * len(text) // 2), max(1, font_size)
     
-    # 🔹 STEP 1: Label map
-    label_map = np.zeros((h, w), dtype=np.int32)
-    for color_idx, color in enumerate(palette):
-        mask = np.all(quantized == color, axis=2)
-        label_map[mask] = color_idx + 1  # 0 = background
-    
-    # 🔹 STEP 2: Единая карта границ
-    grad_x = np.abs(np.diff(label_map, axis=1, prepend=label_map[:, :1]))
-    grad_y = np.abs(np.diff(label_map, axis=0, prepend=label_map[:1, :]))
-    boundary_mask = ((grad_x > 0) | (grad_y > 0)).astype(np.uint8)
-    
-    # Утолщение
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    boundary_mask = cv2.dilate(boundary_mask, kernel, iterations=config.line_thickness)
-    
-    # 🔹 STEP 3: Контуры
-    contours, _ = cv2.findContours(boundary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contour_canvas = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(contour_canvas, contours, -1, 255, thickness=1)
-    canvas[contour_canvas > 0] = line_rgb
-    
-    # 🔹 STEP 4: Размещение номеров
-    placed_positions = []
-    regions_with_numbers = 0
-    
-    for color_idx, color in enumerate(palette):
-        color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
-        
-        # Очистка
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        
-        # Connected components
-        num, labels_img, stats, _ = cv2.connectedComponentsWithStats(
-            color_mask, connectivity=4, ltype=cv2.CV_32S)
-        
-        for comp_id in range(1, num):
-            area = stats[comp_id, cv2.CC_STAT_AREA]
-            if area < config.min_region_size:
-                continue
-            
-            comp_mask = (labels_img == comp_id).astype(np.uint8)
-            
-            # Pole of inaccessibility
-            pole = get_pole_of_inaccessibility(comp_mask)
-            if pole is None:
-                continue
-            cx, cy = pole
-            
-            # Проверка наложения
-            collision = any(
-                math.hypot(cx - px, cy - py) < font_size * 2.5 
-                for px, py in placed_positions
-            )
-            if collision:
-                continue
-            
-            num_str = str(color_idx + 1)
-            text_w, text_h = safe_text_size(num_str, font)
-            
-            # Белый фон
-            padding = 3
-            x1 = max(0, cx - text_w//2 - padding)
-            y1 = max(0, cy - text_h//2 - padding)
-            x2 = min(w, cx + text_w//2 + padding)
-            y2 = min(h, cy + text_h//2 + padding)
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
-            
-            # Номер через PIL
-            pil_img = Image.fromarray(canvas)
-            draw = ImageDraw.Draw(pil_img)
-            draw.text((cx - text_w//2, cy - text_h//2 + 1), num_str, 
-                     fill='black', font=font)
-            canvas = np.array(pil_img)
-            
-            placed_positions.append((cx, cy))
-            regions_with_numbers += 1
-    
-    logger.info(f"✅ Номеров размещено: {regions_with_numbers} из {len(palette)} цветов")
-    
-    # Сохранение
-    output = io.BytesIO()
-    Image.fromarray(canvas).save(output, format='PNG', dpi=(300, 300))
-    output.seek(0)
-    return output
-
-
-# ============================================
-# 📐 ЗАМЕНА: generate_svg_output()
-# ============================================
-
-def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int,int,int]], 
-                       config) -> str:
-    """Генерация SVG с оптимизированными путями"""
-    h, w = quantized.shape[:2]
-    line_rgb = config.line_rgb
-    font_size = config.font_size
-    
-    svg_parts = [
-        f'<?xml version="1.0" encoding="UTF-8"?>',
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
-        f'<rect width="100%" height="100%" fill="white"/>',
-        f'<style>.region{{fill:none;stroke:rgb{line_rgb};stroke-width:{config.line_thickness};stroke-linejoin:round;stroke-linecap:round}}</style>',
-    ]
-    
-    placed_positions = []
-    
-    # Единая карта границ для SVG
     label_map = np.zeros((h, w), dtype=np.int32)
     for color_idx, color in enumerate(palette):
         mask = np.all(quantized == color, axis=2)
@@ -543,130 +381,258 @@ def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int,int,int]]
     grad_x = np.abs(np.diff(label_map, axis=1, prepend=label_map[:, :1]))
     grad_y = np.abs(np.diff(label_map, axis=0, prepend=label_map[:1, :]))
     boundary_mask = ((grad_x > 0) | (grad_y > 0)).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    boundary_mask = cv2.dilate(boundary_mask, kernel, iterations=config.line_thickness)
     
+    contours, _ = cv2.findContours(boundary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour_canvas = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(contour_canvas, contours, -1, 255, thickness=1)
+    canvas[contour_canvas > 0] = line_rgb
+    
+    placed_positions = []
+    regions_with_numbers = 0
+    
+    for color_idx, color in enumerate(palette):
+        color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        num, labels_img, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=4, ltype=cv2.CV_32S)
+        
+        for comp_id in range(1, num):
+            if stats[comp_id, cv2.CC_STAT_AREA] < config.min_region_size: continue
+            comp_mask = (labels_img == comp_id).astype(np.uint8)
+            pole = get_pole_of_inaccessibility(comp_mask)
+            if pole is None: continue
+            cx, cy = pole
+            
+            if any(math.hypot(cx - px, cy - py) < font_size * 2.5 for px, py in placed_positions):
+                continue
+            
+            num_str = str(color_idx + 1)
+            text_w, text_h = safe_text_size(num_str, font)
+            padding = 3
+            x1, y1 = max(0, cx - text_w//2 - padding), max(0, cy - text_h//2 - padding)
+            x2, y2 = min(w, cx + text_w//2 + padding), min(h, cy + text_h//2 + padding)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+            
+            pil_img = Image.fromarray(canvas)
+            draw = ImageDraw.Draw(pil_img)
+            draw.text((cx - text_w//2, cy - text_h//2 + 1), num_str, fill='black', font=font)
+            canvas = np.array(pil_img)
+            placed_positions.append((cx, cy))
+            regions_with_numbers += 1
+            
+    output = io.BytesIO()
+    Image.fromarray(canvas).save(output, format='PNG', dpi=(300, 300))
+    output.seek(0)
+    return output
+
+def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int,int,int]], config: PBNConfig) -> str:
+    h, w = quantized.shape[:2]
+    line_rgb = config.line_rgb
+    font_size = config.font_size
+    svg_parts = [
+        f'<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
+        f'<rect width="100%" height="100%" fill="white"/>',
+        f'<style>.region{{fill:none;stroke:rgb{line_rgb};stroke-width:{config.line_thickness};stroke-linejoin:round}}</style>',
+    ]
+    placed_positions = []
+    label_map = np.zeros((h, w), dtype=np.int32)
+    for color_idx, color in enumerate(palette):
+        mask = np.all(quantized == color, axis=2)
+        label_map[mask] = color_idx + 1
+        
+    grad_x = np.abs(np.diff(label_map, axis=1, prepend=label_map[:, :1]))
+    grad_y = np.abs(np.diff(label_map, axis=0, prepend=label_map[:1, :]))
+    boundary_mask = ((grad_x > 0) | (grad_y > 0)).astype(np.uint8)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     boundary_mask = cv2.dilate(boundary_mask, kernel, iterations=1)
-    
     contours, _ = cv2.findContours(boundary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < config.min_region_size * 0.5:
-            continue
-        
-        # Упрощение контура для SVG
-        epsilon = 0.5  # пиксели
-        simplified = cv2.approxPolyDP(contour, epsilon, True)
-        
-        if len(simplified) < 3:
-            continue
-        
-        # Построение path
+        if cv2.contourArea(contour) < config.min_region_size * 0.5: continue
+        simplified = cv2.approxPolyDP(contour, 0.5, True)
+        if len(simplified) < 3: continue
         path_d = f"M {simplified[0][0][0]},{simplified[0][0][1]}"
         for point in simplified[1:]:
             x, y = point[0]
             path_d += f" L {x},{y}"
         path_d += " Z"
-        
         svg_parts.append(f'<path class="region" d="{path_d}"/>')
-    
-    # Номера
+        
     for color_idx, color in enumerate(palette):
         color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, 
-                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), iterations=1)
-        
-        num, labels_img, stats, _ = cv2.connectedComponentsWithStats(
-            color_mask, connectivity=4, ltype=cv2.CV_32S)
-        
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), iterations=1)
+        num, labels_img, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=4, ltype=cv2.CV_32S)
         for comp_id in range(1, num):
-            if stats[comp_id, cv2.CC_STAT_AREA] < config.min_region_size:
-                continue
-            
+            if stats[comp_id, cv2.CC_STAT_AREA] < config.min_region_size: continue
             comp_mask = (labels_img == comp_id).astype(np.uint8)
             pole = get_pole_of_inaccessibility(comp_mask)
-            if pole is None:
-                continue
+            if pole is None: continue
             cx, cy = pole
-            
-            # Проверка наложения
-            if any(math.hypot(cx - px, cy - py) < font_size * 2.5 for px, py in placed_positions):
-                continue
-            
+            if any(math.hypot(cx - px, cy - py) < font_size * 2.5 for px, py in placed_positions): continue
             num_str = str(color_idx + 1)
-            
-            # Фон и текст
             svg_parts.append(f'<circle cx="{cx}" cy="{cy}" r="{font_size//2 + 3}" fill="white" stroke="none"/>')
-            svg_parts.append(f'<text x="{cx}" y="{cy}" text-anchor="middle" dominant-baseline="central" '
-                           f'font-size="{font_size}" font-family="Arial, sans-serif" fill="black" '
-                           f'stroke="white" stroke-width="0.5">{num_str}</text>')
+            svg_parts.append(f'<text x="{cx}" y="{cy}" text-anchor="middle" dominant-baseline="central" font-size="{font_size}" font-family="Arial" fill="black">{num_str}</text>')
             placed_positions.append((cx, cy))
-    
     svg_parts.append('</svg>')
     return '\n'.join(svg_parts)
 
+def create_palette_image(palette: List[Tuple[int, int, int]], config: PBNConfig) -> Image.Image:
+    n_colors = len(palette)
+    palette_width = 320
+    palette_height = 80 + n_colors * 40
+    palette_img = Image.new('RGB', (palette_width, palette_height), 'white')
+    draw = ImageDraw.Draw(palette_img)
+    font = get_font(13)
+    title_font = get_font(16)
+    draw.text((15, 15), "🎨 ПАЛИТРА ЦВЕТОВ", fill='black', font=title_font)
+    draw.text((15, 38), f"Цветов: {n_colors}", fill='gray', font=font)
+    for idx, color in enumerate(palette, start=1):
+        y_pos = 65 + (idx - 1) * 40
+        draw.rectangle([(15, y_pos), (48, y_pos + 30)], fill=color, outline=(200, 200, 200), width=2)
+        draw.text((58, y_pos + 6), f"{idx}.", fill='black', font=font)
+        hex_color = f'#{color[0]:02x}{color[1]:02x}{color[2]:02x}'.upper()
+        draw.text((95, y_pos + 6), hex_color, fill=(100, 100, 100), font=font)
+    return palette_img
 
-# ============================================
-# 🔧 ОБНОВЛЁННЫЙ: process_image_for_coloring()
-# ============================================
-
-def process_image_for_coloring(photo_bytes: bytes, config) -> Tuple[io.BytesIO, io.BytesIO, Optional[str]]:
-    """
-    Полный пайплайн с новым алгоритмом.
-    Drop-in замена для вашей функции.
-    """
-    from PIL import Image
-    
-    # Загрузка и препроцессинг (ваш код)
+def process_image_for_coloring(photo_bytes: bytes, config: PBNConfig) -> Tuple[io.BytesIO, io.BytesIO, Optional[str]]:
     image = Image.open(io.BytesIO(photo_bytes))
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-    
-    # Resize
+    if image.mode != 'RGB': image = image.convert('RGB')
     width, height = image.size
     if max(width, height) > config.max_image_size:
         ratio = config.max_image_size / max(width, height)
         new_size = (int(width * ratio), int(height * ratio))
         image = image.resize(new_size, Image.Resampling.LANCZOS)
-    
     img_array = np.array(image)
     
-    # 🔹 Новый пайплайн
-    logger.info("🎨 Запуск гибридной сегментации...")
-    
-    # 1. Сегментация (SLIC + Mean Shift)
+    logger.info("🎨 Segmentation...")
     quantized, labels, palette = segment_image_advanced(img_array, config)
     
-    # 2. Удаление тонких регионов
-    logger.info("✂️  Удаление тонких областей...")
+    logger.info("✂️ Removing thin regions...")
     quantized = remove_thin_regions_scan(quantized, min_length=7, iterations=3)
     
-    # 3. Умное слияние регионов
-    logger.info("🔗 Слияние регионов через RAG...")
-    quantized, labels, palette = merge_regions_rag(
-        quantized, labels, palette, 
-        min_area=config.min_region_size,
-        target_regions=config.n_colors * 4
-    )
+    logger.info("🔗 Merging regions...")
+    quantized, labels, palette = merge_regions_rag(quantized, labels, palette, min_area=config.min_region_size, target_regions=config.n_colors * 4)
     
-    # 4. Генерация выходов
-    logger.info("✏️  Генерация раскраски...")
+    logger.info("✏️ Generating output...")
     coloring_buffer = create_coloring_page_raster(quantized, palette, config)
     
     palette_buffer = io.BytesIO()
-    from your_bot_file import create_palette_image  # импортируем вашу функцию
     palette_img = create_palette_image(palette, config)
     palette_img.save(palette_buffer, format='PNG', dpi=(300, 300))
     palette_buffer.seek(0)
     
-    # SVG (опционально)
     svg_output = None
     if config.export_svg:
-        try:
-            svg_output = generate_svg_output(quantized, palette, config)
-        except Exception as e:
-            logger.warning(f"SVG generation failed: {e}")
-    
-    logger.info(f"✅ Готово! Палитра: {len(palette)} цветов")
-    
+        try: svg_output = generate_svg_output(quantized, palette, config)
+        except Exception as e: logger.warning(f"SVG failed: {e}")
+        
     return coloring_buffer, palette_buffer, svg_output
+
+
+# ============================================
+# TELEGRAM BOT HANDLERS
+# ============================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        '🎨 <b>Paint by Numbers Bot v4.0</b>\n\n'
+        'Отправьте фото — получите раскраску!\n\n'
+        '<b>Настройки:</b>\n'
+        '<code>/colors 16</code> (3-48)\n'
+        '<code>/detail 180</code> (50-500)\n'
+        '<code>/settings</code>',
+        parse_mode='HTML'
+    )
+
+async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = PBNConfig.from_user_data(context.user_data)
+    settings = (
+        f'⚙️ <b>Настройки:</b>\n'
+        f'🎨 Цветов: {cfg.n_colors}\n'
+        f'📏 Мин. область: {cfg.min_region_size}px\n'
+        f'🖼️ Размер: {cfg.max_image_size}px\n'
+        f'📄 SVG: {"✅" if cfg.export_svg else "❌"}'
+    )
+    await update.message.reply_text(settings, parse_mode='HTML')
+
+def make_setter(param_name: str, param_type: type, min_val, max_val, success_msg: str, valid_values: Optional[List[str]] = None):
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await update.message.reply_text(f'❌ Используйте: <code>/{param_name} значение</code>', parse_mode='HTML')
+            return
+        arg = context.args[0].lower()
+        if valid_values:
+            if arg not in valid_values:
+                await update.message.reply_text(f'❌ Допустимо: {", ".join(valid_values)}', parse_mode='HTML')
+                return
+            value = arg
+        else:
+            try:
+                value = param_type(arg)
+                if not (min_val <= value <= max_val): raise ValueError
+            except ValueError:
+                await update.message.reply_text(f'❌ Число от {min_val} до {max_val}', parse_mode='HTML')
+                return
+        context.user_data[param_name] = value
+        await update.message.reply_text(f'✅ {success_msg.format(value)}', parse_mode='HTML')
+    return handler
+
+set_colors = make_setter('n_colors', int, 3, 48, 'Установлено {} цветов')
+set_detail = make_setter('min_region_size', int, 50, 500, 'Мин. область: {}px')
+set_size = make_setter('max_image_size', int, 800, 4000, 'Макс. размер: {}px')
+set_svg = make_setter('export_svg', lambda x: x.lower() in ['on','true','1'], 0, 1, 'SVG: {}', valid_values=['on','off','true','false','1','0'])
+
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    photo = message.photo[-1]
+    cfg = PBNConfig.from_user_data(context.user_data)
+    
+    status_msg = await message.reply_text('🎨 Обработка...')
+    try:
+        file = await photo.get_file()
+        photo_bytes = await file.download_as_bytearray()
+        coloring_buf, palette_buf, svg_output = await asyncio.to_thread(process_image_for_coloring, bytes(photo_bytes), cfg)
+        
+        await message.reply_document(document=coloring_buf, filename='coloring_page.png', caption='🖼️ Раскраска')
+        await message.reply_photo(palette_buf, caption='🎨 Палитра')
+        if svg_output and cfg.export_svg:
+            svg_buf = io.BytesIO(svg_output.encode('utf-8'))
+            await message.reply_document(document=svg_buf, filename='coloring_page.svg', caption='📐 SVG версия')
+    except Exception as e:
+        logger.exception(f"Error: {e}")
+        await message.reply_text(f'❌ Ошибка: {str(e)}')
+    finally:
+        await status_msg.delete()
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(f'ID: <code>{update.effective_user.id}</code>', parse_mode='HTML')
+
+async def update_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text('❌ Только админ')
+        return
+    status_msg = await update.message.reply_text('🔄 Обновление...')
+    if trigger_self_update():
+        await status_msg.edit_text('✅ Запрос отправлен')
+    else:
+        await status_msg.edit_text('❌ Ошибка')
+
+def main() -> None:
+    logger.info("🚀 Starting Bot v4.0...")
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('settings', show_settings))
+    application.add_handler(CommandHandler('colors', set_colors))
+    application.add_handler(CommandHandler('detail', set_detail))
+    application.add_handler(CommandHandler('size', set_size))
+    application.add_handler(CommandHandler('svg', set_svg))
+    application.add_handler(CommandHandler('myid', myid))
+    application.add_handler(CommandHandler('update', update_bot))
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+if __name__ == '__main__':
+    main()
