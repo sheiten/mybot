@@ -93,7 +93,6 @@ DEFAULT_CONFIG = {
     'color_space': 'lab',
     'spatial_weight': 0.12,
     'use_minibatch': True,
-    'export_svg': False,
     'n_segments_multiplier': 40,
     'compactness': 5.0,
     'sigma': 0.5,  # ← Добавить
@@ -133,7 +132,6 @@ class PBNConfig:
     color_space: str = 'lab'
     spatial_weight: float = 0.12
     use_minibatch: bool = True
-    export_svg: bool = False
     n_segments_multiplier: int = 40  # Множитель для количества суперпикселей
     compactness: float = 5.0         # Компактность суперпикселей
     sigma: float = 0.5
@@ -640,58 +638,6 @@ def create_coloring_page_raster(
 
    return output
 
-def generate_svg_output(quantized: np.ndarray, palette: List[Tuple[int,int,int]], config: PBNConfig) -> str:
-    h, w = quantized.shape[:2]
-    line_rgb = config.line_rgb
-    font_size = config.font_size
-    svg_parts = [
-        f'<?xml version="1.0" encoding="UTF-8"?>',
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
-        f'<rect width="100%" height="100%" fill="white"/>',
-        f'<style>.region{{fill:none;stroke:rgb{line_rgb};stroke-width:{config.line_thickness};stroke-linejoin:round}}</style>',
-    ]
-    placed_positions = []
-    label_map = np.zeros((h, w), dtype=np.int32)
-    for color_idx, color in enumerate(palette):
-        mask = np.all(quantized == color, axis=2)
-        label_map[mask] = color_idx + 1
-        
-    grad_x = np.abs(np.diff(label_map, axis=1, prepend=label_map[:, :1]))
-    grad_y = np.abs(np.diff(label_map, axis=0, prepend=label_map[:1, :]))
-    boundary_mask = ((grad_x > 0) | (grad_y > 0)).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    boundary_mask = cv2.dilate(boundary_mask, kernel, iterations=1)
-    contours, _ = cv2.findContours(boundary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for contour in contours:
-        if cv2.contourArea(contour) < config.min_region_size * 0.5: continue
-        simplified = cv2.approxPolyDP(contour, 0.5, True)
-        if len(simplified) < 3: continue
-        path_d = f"M {simplified[0][0][0]},{simplified[0][0][1]}"
-        for point in simplified[1:]:
-            x, y = point[0]
-            path_d += f" L {x},{y}"
-        path_d += " Z"
-        svg_parts.append(f'<path class="region" d="{path_d}"/>')
-        
-    for color_idx, color in enumerate(palette):
-        color_mask = np.all(quantized == color, axis=2).astype(np.uint8) * 255
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), iterations=1)
-        num, labels_img, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=4, ltype=cv2.CV_32S)
-        for comp_id in range(1, num):
-            if stats[comp_id, cv2.CC_STAT_AREA] < config.min_region_size: continue
-            comp_mask = (labels_img == comp_id).astype(np.uint8)
-            pole = get_pole_of_inaccessibility(comp_mask)
-            if pole is None: continue
-            cx, cy = pole
-            if any(math.hypot(cx - px, cy - py) < font_size * 2.5 for px, py in placed_positions): continue
-            num_str = str(color_idx + 1)
-            svg_parts.append(f'<circle cx="{cx}" cy="{cy}" r="{font_size//2 + 3}" fill="white" stroke="none"/>')
-            svg_parts.append(f'<text x="{cx}" y="{cy}" text-anchor="middle" dominant-baseline="central" font-size="{font_size}" font-family="Arial" fill="black">{num_str}</text>')
-            placed_positions.append((cx, cy))
-    svg_parts.append('</svg>')
-    return '\n'.join(svg_parts)
-
 def create_palette_image(palette: List[Tuple[int, int, int]], config: PBNConfig) -> Image.Image:
     n_colors = len(palette)
     palette_width = 320
@@ -852,7 +798,6 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f'🔲 Множитель суперпикселей: {cfg.n_segments_multiplier}\n'
         f'📐 Компактность: {cfg.compactness}\n'
         f'🎚️ Sigma (сглаживание): {cfg.sigma}\n'
-        f'📄 SVG: {"✅" if cfg.export_svg else "❌"}'
     )
     await update.message.reply_text(settings, parse_mode='HTML')
 
@@ -884,7 +829,6 @@ def make_setter(param_name: str, param_type: type, min_val, max_val, success_msg
 set_colors = make_setter('n_colors', int, 3, 48, 'Установлено {} цветов')
 set_detail = make_setter('min_region_size', int, 50, 500, 'Мин. область: {}px')
 set_size = make_setter('max_image_size', int, 800, 4000, 'Макс. размер: {}px')
-set_svg = make_setter('export_svg', lambda x: x.lower() in ['on','true','1'], 0, 1, 'SVG: {}', valid_values=['on','off','true','false','1','0'])
 set_segments_multiplier = make_setter('n_segments_multiplier', int, 10, 100, 'Множитель суперпикселей: {} (всего будет цветов × {})')
 set_compactness = make_setter('compactness', float, 1.0, 20.0, 'Компактность суперпикселей: {} (меньше = точнее границы)')
 set_sigma = make_setter('sigma', float, 0.1, 5.0, 'Sigma (сглаживание): {} (меньше = четче границы)')
@@ -904,9 +848,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         await message.reply_document(document=coloring_buf, filename='coloring_page.png', caption='🖼️ Раскраска')
         await message.reply_photo(palette_buf, caption='🎨 Палитра')
-        if svg_output and cfg.export_svg:
-            svg_buf = io.BytesIO(svg_output.encode('utf-8'))
-            await message.reply_document(document=svg_buf, filename='coloring_page.svg', caption='📐 SVG версия')
+        
     except Exception as e:
         logger.exception(f"Error: {e}")
         await message.reply_text(f'❌ Ошибка: {str(e)}')
@@ -920,13 +862,12 @@ def main() -> None:
     logger.info("🚀 Starting Bot v4.0...")
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('settings', show_settings))
+    application.add_handler(CommandHandler('set', show_settings))
     application.add_handler(CommandHandler('colors', set_colors))
     application.add_handler(CommandHandler('detail', set_detail))
     application.add_handler(CommandHandler('size', set_size))
-    application.add_handler(CommandHandler('svg', set_svg))
-    application.add_handler(CommandHandler('segments_multiplier', set_segments_multiplier))
-    application.add_handler(CommandHandler('compactness', set_compactness))
+    application.add_handler(CommandHandler('segmul', set_segments_multiplier))
+    application.add_handler(CommandHandler('comp', set_compactness))
     application.add_handler(CommandHandler('sigma', set_sigma))
     application.add_handler(CommandHandler('myid', myid))
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
