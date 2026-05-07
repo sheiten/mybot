@@ -28,6 +28,37 @@ import cv2
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+
+# ============================================
+# ALLOWED USERS (Добавить после конфигурации)
+# ============================================
+
+# Список ID разрешенных пользователей
+ALLOWED_USER_IDS = [
+    931848809,  # Ваш ID (админ)
+    # 123456789,  # ID второго пользователя (замените на реальный)
+]
+
+# ============================================
+# ACCESS CONTROL (Добавить после ALLOWED_USERS)
+# ============================================
+
+async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Проверка доступа пользователя"""
+    user_id = update.effective_user.id
+    
+    if not is_user_allowed(user_id):
+        logger.warning(f"Access denied for user {user_id}")
+        await update.message.reply_text(
+            '❌ Доступ запрещен. Бот доступен только для ограниченного круга пользователей.',
+            parse_mode='HTML'
+        )
+        return False
+    return True
+def is_user_allowed(user_id: int) -> bool:
+    """Проверка, разрешен ли пользователь"""
+    return user_id in ALLOWED_USER_IDS
+    
 # ============================================
 # GLOBAL EXCEPTION HANDLER (Для отладки в Docker)
 # ============================================
@@ -53,9 +84,9 @@ PORTAINER_TOKEN = os.environ.get('PORTAINER_TOKEN', '')
 ADMIN_ID = int(os.environ.get('ADMIN_USER_ID', '931848809'))
 
 DEFAULT_CONFIG = {
-    'n_colors': 16,           # Оптимально для нового алгоритма
-    'min_region_size': 180,   # Чуть больше для чистоты
-    'max_image_size': 1200,   # Баланс скорости/качества
+    'n_colors': 16,
+    'min_region_size': 180,
+    'max_image_size': 1200,
     'line_thickness': 1,
     'line_color': 'gray',
     'font_size': 12,
@@ -64,8 +95,9 @@ DEFAULT_CONFIG = {
     'spatial_weight': 0.12,
     'use_minibatch': True,
     'export_svg': False,
-    'n_segments_multiplier': 40,  # Множитель для количества суперпикселей (n_colors * multiplier)
-    'compactness': 5.0,           # Компактность суперпикселей (меньше = точнее границы)
+    'n_segments_multiplier': 40,
+    'compactness': 5.0,
+    'sigma': 0.5,  # ← Добавить
 }
 
 LINE_COLORS = {
@@ -105,6 +137,7 @@ class PBNConfig:
     export_svg: bool = False
     n_segments_multiplier: int = 40  # Множитель для количества суперпикселей
     compactness: float = 5.0         # Компактность суперпикселей
+    sigma: float = 0.5
     
     @property
     def line_rgb(self) -> Tuple[int, int, int]:
@@ -679,7 +712,7 @@ def create_palette_image(palette: List[Tuple[int, int, int]], config: PBNConfig)
     return palette_img
 
 def process_image_for_coloring(
- photo_bytes: bytes,
+    photo_bytes: bytes,
     config: PBNConfig
 ) -> Tuple[io.BytesIO, io.BytesIO, Optional[str]]:
     """
@@ -712,20 +745,18 @@ def process_image_for_coloring(
     # Используем настраиваемые параметры суперпикселей
     n_segments = min(config.n_colors * config.n_segments_multiplier, 1500)
     compactness_value = config.compactness
+    sigma_value = config.sigma  # ← Добавить
     
-    logger.info(f"SLIC parameters: n_segments={n_segments}, compactness={compactness_value}")
+    logger.info(f"SLIC parameters: n_segments={n_segments}, compactness={compactness_value}, sigma={sigma_value}")
     
     segments = slic(
         img_lab,
         n_segments=n_segments,
         compactness=compactness_value,
-        sigma=0.5,
+        sigma=sigma_value,  # ← Изменить (было sigma=0.5)
         start_label=1,
         enforce_connectivity=True
     )
-    
-    logger.info(f"SLIC created {len(np.unique(segments))} superpixels")
-    
     # 4. Собираем средние цвета суперпикселей
     unique_segs = np.unique(segments)
     superpixel_colors = []
@@ -789,20 +820,25 @@ def process_image_for_coloring(
 # ============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
     await update.message.reply_text(
         '🎨 <b>Paint by Numbers Bot v4.0</b>\n\n'
         'Отправьте фото — получите раскраску!\n\n'
         '<b>Настройки:</b>\n'
-        '<code>/colors 16</code> (3-48)\n'
-        '<code>/detail 180</code> (50-500)\n'
-        '<code>/size 1200</code> (800-4000)\n'
+        '<code>/colors 16</code> (3-48) - количество цветов\n'
+        '<code>/detail 180</code> (50-500) - мин. размер области\n'
+        '<code>/size 1200</code> (800-4000) - макс. размер\n'
         '<code>/segments_multiplier 40</code> (10-100) - кол-во суперпикселей\n'
         '<code>/compactness 5.0</code> (1-20) - компактность границ\n'
-        '<code>/settings</code>',
+        '<code>/sigma 0.5</code> (0.1-5.0) - сглаживание (меньше = четче)\n'
+        '<code>/settings</code> - показать все настройки',
         parse_mode='HTML'
     )
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
     cfg = PBNConfig.from_user_data(context.user_data)
     settings = (
         f'⚙️ <b>Настройки:</b>\n'
@@ -811,11 +847,14 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f'🖼️ Размер: {cfg.max_image_size}px\n'
         f'🔲 Множитель суперпикселей: {cfg.n_segments_multiplier}\n'
         f'📐 Компактность: {cfg.compactness}\n'
+        f'🎚️ Sigma (сглаживание): {cfg.sigma}\n'
         f'📄 SVG: {"✅" if cfg.export_svg else "❌"}'
     )
     await update.message.reply_text(settings, parse_mode='HTML')
 
 def make_setter(param_name: str, param_type: type, min_val, max_val, success_msg: str, valid_values: Optional[List[str]] = None):
+    if not await check_access(update, context):
+        return
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not context.args:
             await update.message.reply_text(f'❌ Используйте: <code>/{param_name} значение</code>', parse_mode='HTML')
@@ -845,6 +884,8 @@ set_segments_multiplier = make_setter('n_segments_multiplier', int, 10, 100, 'М
 set_compactness = make_setter('compactness', float, 1.0, 20.0, 'Компактность суперпикселей: {} (меньше = точнее границы)')
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update, context):
+        return
     message = update.message
     photo = message.photo[-1]
     cfg = PBNConfig.from_user_data(context.user_data)
@@ -869,16 +910,6 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f'ID: <code>{update.effective_user.id}</code>', parse_mode='HTML')
 
-async def update_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text('❌ Только админ')
-        return
-    status_msg = await update.message.reply_text('🔄 Обновление...')
-    if trigger_self_update():
-        await status_msg.edit_text('✅ Запрос отправлен')
-    else:
-        await status_msg.edit_text('❌ Ошибка')
-
 def main() -> None:
     logger.info("🚀 Starting Bot v4.0...")
     application = Application.builder().token(TOKEN).build()
@@ -890,8 +921,8 @@ def main() -> None:
     application.add_handler(CommandHandler('svg', set_svg))
     application.add_handler(CommandHandler('segments_multiplier', set_segments_multiplier))
     application.add_handler(CommandHandler('compactness', set_compactness))
+    application.add_handler(CommandHandler('sigma', set_sigma))
     application.add_handler(CommandHandler('myid', myid))
-    application.add_handler(CommandHandler('update', update_bot))
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
