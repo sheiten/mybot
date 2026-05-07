@@ -674,129 +674,105 @@ def create_palette_image(palette: List[Tuple[int, int, int]], config: PBNConfig)
     return palette_img
 
 def process_image_for_coloring(
-   photo_bytes: bytes,
-   config: PBNConfig
+ photo_bytes: bytes,
+    config: PBNConfig
 ) -> Tuple[io.BytesIO, io.BytesIO, Optional[str]]:
-
-   image = Image.open(io.BytesIO(photo_bytes))
-
-   if image.mode != "RGB":
-       image = image.convert("RGB")
-
-   width, height = image.size
-
-   # --------------------------------------------------
-   # HQ resize
-   # --------------------------------------------------
-   if max(width, height) > config.max_image_size:
-       ratio = config.max_image_size / max(width, height)
-
-       image = image.resize(
-           (
-               int(width * ratio),
-               int(height * ratio)
-           ),
-           Image.Resampling.LANCZOS
-       )
-
-   img = np.array(image)
-
-   # --------------------------------------------------
-   # PREPROCESS HQ
-   # --------------------------------------------------
-   img = cv2.bilateralFilter(img, 9, 60, 60)
-   img = cv2.fastNlMeansDenoisingColored(img, None, 4, 4, 7, 21)
-
-   h, w = img.shape[:2]
-
-   logger.info("1. HQ Quantization...")
-
-   pixels = img.reshape(-1, 3).astype(np.float32)
-
-   kmeans = MiniBatchKMeans(
-       n_clusters=config.n_colors,
-       random_state=42,
-       batch_size=4096,
-       n_init=8
-   )
-
-   labels = kmeans.fit_predict(pixels)
-   centers = kmeans.cluster_centers_.astype(np.uint8)
-
-   # сортировка палитры по яркости
-   brightness = np.dot(centers, [0.299, 0.587, 0.114])
-   order = np.argsort(brightness)
-
-   palette = [tuple(centers[i]) for i in order]
-
-   quantized_flat = np.zeros_like(pixels)
-
-   for new_idx, old_idx in enumerate(order):
-       quantized_flat[labels == old_idx] = centers[old_idx]
-
-   quantized = quantized_flat.reshape(h, w, 3).astype(np.uint8)
-
-   # --------------------------------------------------
-   # CLEANING
-   # --------------------------------------------------
-   quantized = cv2.medianBlur(quantized, 3)
-   quantized = remove_thin_regions_scan(
-       quantized,
-       min_length=6,
-       iterations=2
-   )
-
-   logger.info("2. Region merge...")
-
-   # --------------------------------------------------
-   # label map
-   # --------------------------------------------------
-   label_map = np.zeros((h, w), dtype=np.int32)
-
-   for idx, color in enumerate(palette):
-       mask = np.all(quantized == color, axis=2)
-       label_map[mask] = idx
-
-   quantized, label_map, palette = merge_regions_rag(
-       quantized,
-       label_map,
-       palette,
-       min_area=config.min_region_size,
-       target_regions=config.n_colors * 3
-   )
-
-   # --------------------------------------------------
-   # Final raster
-   # --------------------------------------------------
-   logger.info("3. Final render...")
-
-   coloring_buffer = create_coloring_page_raster(
-       quantized,
-       palette,
-       config
-   )
-
-   # --------------------------------------------------
-   # Palette image
-   # --------------------------------------------------
-   palette_buffer = io.BytesIO()
-
-   palette_img = create_palette_image(
-       palette,
-       config
-   )
-
-   palette_img.save(
-       palette_buffer,
-       format="PNG",
-       dpi=(300, 300)
-   )
-
-   palette_buffer.seek(0)
-
-   logger.info("✅ Done HQ v5 PRO")
-
-   return coloring_buffer, palette_buffer, None
+    """
+    Профессиональный пайплайн: SLIC + K-Means палитра + постобработка
+    """
+    image = Image.open(io.BytesIO(photo_bytes))
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    
+    # 1. Ресайз
+    width, height = image.size
+    if max(width, height) > config.max_image_size:
+        ratio = config.max_image_size / max(width, height)
+        image = image.resize(
+            (int(width * ratio), int(height * ratio)),
+            Image.Resampling.LANCZOS
+        )
+    
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+    
+    # 2. Легкая фильтрация
+    img_smooth = cv2.bilateralFilter(img_array, d=7, sigmaColor=50, sigmaSpace=50)
+    
+    # 3. SLIC сегментация — создаем суперпиксели
+    img_lab = cv2.cvtColor(img_smooth, cv2.COLOR_RGB2LAB).astype(np.float32)
+    img_lab[:, :, 0] /= 100.0
+    img_lab[:, :, 1:] /= 255.0
+    
+    n_segments = min(config.n_colors * 15, 800)
+    segments = slic(
+        img_lab,
+        n_segments=n_segments,
+        compactness=15.0,
+        sigma=1.5,
+        start_label=1,
+        enforce_connectivity=True
+    )
+    
+    logger.info(f"SLIC created {len(np.unique(segments))} superpixels")
+    
+    # 4. Собираем средние цвета суперпикселей
+    unique_segs = np.unique(segments)
+    superpixel_colors = []
+    superpixel_masks = []
+    
+    for seg_id in unique_segs:
+        if seg_id == 0:
+            continue
+        mask = (segments == seg_id)
+        if np.sum(mask) < 20:  # игнорируем крошечные
+            continue
+        avg_color = np.mean(img_array[mask], axis=0)
+        superpixel_colors.append(avg_color)
+        superpixel_masks.append((seg_id, mask))
+    
+    logger.info(f"Valid superpixels: {len(superpixel_colors)}")
+    
+    # 5. K-Means для итоговой палитры
+    superpixel_colors = np.array(superpixel_colors)
+    kmeans = MiniBatchKMeans(
+        n_clusters=config.n_colors,
+        random_state=42,
+        batch_size=256,
+        n_init=5
+    )
+    cluster_labels = kmeans.fit_predict(superpixel_colors)
+    palette_rgb = kmeans.cluster_centers_.astype(np.uint8)
+    
+    # 6. Сортировка палитры по яркости
+    brightness = np.dot(palette_rgb, [0.299, 0.587, 0.114])
+    sorted_idx = np.argsort(brightness)
+    palette = [tuple(palette_rgb[i]) for i in sorted_idx]
+    
+    # 7. Переназначаем цвета суперпикселей
+    quantized = np.zeros_like(img_array)
+    label_map = np.zeros((h, w), dtype=np.int32)
+    
+    for i, (seg_id, mask) in enumerate(superpixel_masks):
+        cluster = cluster_labels[i]
+        new_idx = list(sorted_idx).index(cluster)
+        quantized[mask] = palette[new_idx]
+        label_map[mask] = new_idx + 1
+    
+    # 8. Сглаживание границ
+    for c in range(3):
+        quantized[:, :, c] = cv2.medianBlur(quantized[:, :, c], 3)
+    
+    logger.info(f"Final palette: {len(palette)} colors")
+    
+    # 9. Рендерим раскраску и палитру
+    coloring_buffer = create_coloring_page_raster(quantized, palette, config)
+    palette_buffer = io.BytesIO()
+    palette_img = create_palette_image(palette, config)
+    palette_img.save(palette_buffer, format="PNG", dpi=(300, 300))
+    palette_buffer.seek(0)
+    
+    return coloring_buffer, palette_buffer, None
     
 # ============================================
 # TELEGRAM BOT HANDLERS
