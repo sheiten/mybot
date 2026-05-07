@@ -27,7 +27,6 @@ from skimage.segmentation import slic
 import cv2
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 # ============================================
 # ALLOWED USERS (Добавить после конфигурации)
@@ -823,18 +822,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update, context):
         return
     
-    # Создаем клавиатуру с кнопками
-    keyboard = [
-        ["🎨 Настройки", "ℹ️ Помощь"],
-        ["🔽 Скрыть меню"]
-    ]
-    
-    reply_markup = ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True,
-        input_field_placeholder="Отправьте фото или выберите действие..."
-    )
-    
+   
     await update.message.reply_text(
         '🎨 <b>Paint by Numbers Bot v4.0</b>\n\n'
         'Отправьте фото — получите раскраску!\n\n'
@@ -851,36 +839,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode='HTML',
         reply_markup=reply_markup
     )
-async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка текстовых сообщений (для кнопок)"""
-    if not await check_access(update, context):
-        return
-    
-    text = update.message.text
-    
-    if text == "🎨 Настройки":
-        await show_settings(update, context)
-    elif text == "ℹ️ Помощь":
-        await update.message.reply_text(
-            '📖 <b>Помощь</b>\n\n'
-            '1. Отправьте любое фото\n'
-            '2. Бот создаст раскраску по номерам\n'
-            '3. Настройте параметры под свой вкус\n\n'
-            'Все настройки можно изменить командами или через меню.',
-            parse_mode='HTML'
-        )
-    elif text == "🔽 Скрыть меню":
-        await update.message.reply_text(
-            "Клавиатура скрыта. Отправьте /start чтобы показать снова.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-    else:
-        # Если пользователь написал что-то другое
-        await update.message.reply_text(
-            "Используйте кнопки меню или отправьте фото.\n"
-            "Команды начинаются с / (например /settings)"
-        )
-        
+
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update, context):
         return
@@ -970,8 +929,6 @@ def main() -> None:
     application.add_handler(CommandHandler('compactness', set_compactness))
     application.add_handler(CommandHandler('sigma', set_sigma))
     application.add_handler(CommandHandler('myid', myid))
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
