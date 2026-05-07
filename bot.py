@@ -327,6 +327,8 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
     
     max_iterations = 10
     for iteration in range(max_iterations):
+        logger.info(f"RAG iteration {iteration + 1}/{max_iterations}")  # ДОБАВИТЬ ЛОГ
+        
         unique_colors_in_use = np.unique(current_labels)
         
         # Создаем карту уникальных ID регионов
@@ -335,7 +337,6 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
         next_region_id = 1
         
         for color_idx in unique_colors_in_use:
-            # Проверка: цвет должен быть в палитре
             if color_idx < 0 or color_idx >= len(current_palette):
                 continue
                 
@@ -343,11 +344,11 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
             num, comps, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4, ltype=cv2.CV_32S)
             
             for i in range(1, num):
-                if stats[i, cv2.CC_STAT_AREA] < 5: continue
+                if stats[i, cv2.CC_STAT_AREA] < 5: 
+                    continue
                 reg_id = next_region_id
                 region_mask = (comps == i)
                 
-                # Проверка размеров маски
                 if region_mask.shape != (h, w):
                     continue
                     
@@ -360,20 +361,26 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
                 next_region_id += 1
 
         total_regions = len(region_info)
+        logger.info(f"Current regions: {total_regions}, target: {target_regions}")  # ДОБАВИТЬ ЛОГ
+        
         if total_regions <= target_regions:
             break
             
+        # ИСПРАВЛЕНИЕ: создаем список ID для обработки
         sorted_regions = sorted(region_info.items(), key=lambda x: x[1]['area'])
+        merged_ids = set()  # Отслеживаем уже смерженные ID
         merged_count = 0
-        candidates = sorted_regions[:50] 
         
-        for reg_id, info in candidates:
-            if reg_id not in region_info: continue
-            
+        # Обрабатываем только маленькие регионы
+        for reg_id, info in sorted_regions[:50]:
+            if reg_id in merged_ids:
+                continue
+                
             # Проверка площади
-            areas = [r['area'] for r in region_info.values()]
-            if not areas: break
-            median_area = np.median(areas)
+            all_areas = [r['area'] for r in region_info.values()]
+            if not all_areas:
+                break
+            median_area = np.median(all_areas)
             
             if info['area'] > median_area * 2:
                 continue
@@ -383,33 +390,36 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
             dilated = cv2.dilate(mask.astype(np.uint8), kernel)
             boundary = dilated - mask.astype(np.uint8)
             
-            if np.sum(boundary) == 0: continue
+            if np.sum(boundary) == 0:
+                continue
             
-            # Безопасное получение соседей
             try:
-                # boundary имеет тот же размер, что и temp_label_map
                 neighbor_ids = np.unique(temp_label_map[boundary > 0])
-                # Фильтруем: убираем себя, фон (0) и несуществующие ID
-                neighbor_ids = [nid for nid in neighbor_ids if nid != reg_id and nid != 0 and nid in region_info]
+                neighbor_ids = [nid for nid in neighbor_ids 
+                               if nid != reg_id and nid != 0 and nid in region_info]
             except Exception:
                 continue
                 
-            if not neighbor_ids: continue
+            if not neighbor_ids:
+                continue
             
             current_color_idx = info['color_idx']
-            # Проверка границ палитры для текущего цвета
             if current_color_idx >= len(palette_lab):
                 continue
+            
             current_lab = palette_lab[current_color_idx]
             
             best_neighbor_id = None
             min_dist = float('inf')
             
+            # Ищем лучшего соседа (только среди не смерженных)
             for nb_id in neighbor_ids:
+                if nb_id in merged_ids:
+                    continue
+                    
                 nb_info = region_info[nb_id]
                 nb_color_idx = nb_info['color_idx']
                 
-                # Проверка границ палитры для соседа
                 if nb_color_idx >= len(palette_lab):
                     continue
                     
@@ -417,24 +427,30 @@ def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray,
                 dist = np.linalg.norm(current_lab - nb_lab)
                 
                 # Эвристика
-                score = dist / (nb_info['area'] + 1)
+                if nb_info['area'] < 1:
+                    continue
+                score = dist / (nb_info['area'])
                 
                 if score < min_dist:
                     min_dist = score
                     best_neighbor_id = nb_id
             
-            if best_neighbor_id is not None:
+            if best_neighbor_id is not None and best_neighbor_id in region_info:
                 target_color_idx = region_info[best_neighbor_id]['color_idx']
                 
-                # Проверка границ палитры перед записью
                 if target_color_idx < len(current_palette):
+                    # Мержим регионы
                     current_labels[mask] = target_color_idx
                     current_quantized[mask] = current_palette[target_color_idx]
-                    
-                    del region_info[reg_id]
+                    merged_ids.add(reg_id)  # Отмечаем как смерженный
                     merged_count += 1
-
-        if merged_count == 0: break
+                    logger.debug(f"Merged region {reg_id} into {best_neighbor_id}")  # ДОБАВИТЬ ЛОГ
+        
+        logger.info(f"Merged {merged_count} regions in iteration {iteration + 1}")  # ДОБАВИТЬ ЛОГ
+        
+        if merged_count == 0:
+            logger.info("No more regions to merge, stopping")  # ДОБАВИТЬ ЛОГ
+            break
             
     # Финальная очистка
     final_unique_colors = np.unique(current_quantized.reshape(-1, 3), axis=0)
