@@ -27,7 +27,7 @@ from skimage.segmentation import slic
 import cv2
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 # ============================================
 # ALLOWED USERS (Добавить после конфигурации)
@@ -822,20 +822,65 @@ def process_image_for_coloring(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update, context):
         return
+    
+    # Создаем клавиатуру с кнопками
+    keyboard = [
+        ["🎨 Настройки", "ℹ️ Помощь"],
+        ["🔽 Скрыть меню"]
+    ]
+    
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        input_field_placeholder="Отправьте фото или выберите действие..."
+    )
+    
     await update.message.reply_text(
         '🎨 <b>Paint by Numbers Bot v4.0</b>\n\n'
         'Отправьте фото — получите раскраску!\n\n'
-        '<b>Настройки:</b>\n'
+        '<b>Доступные команды:</b>\n'
         '<code>/colors 16</code> (3-48) - количество цветов\n'
         '<code>/detail 180</code> (50-500) - мин. размер области\n'
         '<code>/size 1200</code> (800-4000) - макс. размер\n'
         '<code>/segments_multiplier 40</code> (10-100) - кол-во суперпикселей\n'
         '<code>/compactness 5.0</code> (1-20) - компактность границ\n'
-        '<code>/sigma 0.5</code> (0.1-5.0) - сглаживание (меньше = четче)\n'
-        '<code>/settings</code> - показать все настройки',
-        parse_mode='HTML'
+        '<code>/sigma 0.5</code> (0.1-5.0) - сглаживание\n'
+        '<code>/settings</code> - показать все настройки\n'
+        '<code>/myid</code> - показать мой ID\n\n'
+        'Или используйте кнопки меню ниже 👇',
+        parse_mode='HTML',
+        reply_markup=reply_markup
     )
-
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка текстовых сообщений (для кнопок)"""
+    if not await check_access(update, context):
+        return
+    
+    text = update.message.text
+    
+    if text == "🎨 Настройки":
+        await show_settings(update, context)
+    elif text == "ℹ️ Помощь":
+        await update.message.reply_text(
+            '📖 <b>Помощь</b>\n\n'
+            '1. Отправьте любое фото\n'
+            '2. Бот создаст раскраску по номерам\n'
+            '3. Настройте параметры под свой вкус\n\n'
+            'Все настройки можно изменить командами или через меню.',
+            parse_mode='HTML'
+        )
+    elif text == "🔽 Скрыть меню":
+        await update.message.reply_text(
+            "Клавиатура скрыта. Отправьте /start чтобы показать снова.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    else:
+        # Если пользователь написал что-то другое
+        await update.message.reply_text(
+            "Используйте кнопки меню или отправьте фото.\n"
+            "Команды начинаются с / (например /settings)"
+        )
+        
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update, context):
         return
@@ -853,9 +898,10 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(settings, parse_mode='HTML')
 
 def make_setter(param_name: str, param_type: type, min_val, max_val, success_msg: str, valid_values: Optional[List[str]] = None):
-    if not await check_access(update, context):
-        return
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await check_access(update, context):  # ← перенести проверку сюда
+            return
+        
         if not context.args:
             await update.message.reply_text(f'❌ Используйте: <code>/{param_name} значение</code>', parse_mode='HTML')
             return
@@ -882,6 +928,7 @@ set_size = make_setter('max_image_size', int, 800, 4000, 'Макс. размер
 set_svg = make_setter('export_svg', lambda x: x.lower() in ['on','true','1'], 0, 1, 'SVG: {}', valid_values=['on','off','true','false','1','0'])
 set_segments_multiplier = make_setter('n_segments_multiplier', int, 10, 100, 'Множитель суперпикселей: {} (всего будет цветов × {})')
 set_compactness = make_setter('compactness', float, 1.0, 20.0, 'Компактность суперпикселей: {} (меньше = точнее границы)')
+set_sigma = make_setter('sigma', float, 0.1, 5.0, 'Sigma (сглаживание): {} (меньше = четче границы)')
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update, context):
@@ -923,6 +970,8 @@ def main() -> None:
     application.add_handler(CommandHandler('compactness', set_compactness))
     application.add_handler(CommandHandler('sigma', set_sigma))
     application.add_handler(CommandHandler('myid', myid))
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
