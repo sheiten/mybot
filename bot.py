@@ -64,6 +64,8 @@ DEFAULT_CONFIG = {
     'spatial_weight': 0.12,
     'use_minibatch': True,
     'export_svg': False,
+    'n_segments_multiplier': 40,  # Множитель для количества суперпикселей (n_colors * multiplier)
+    'compactness': 5.0,           # Компактность суперпикселей (меньше = точнее границы)
 }
 
 LINE_COLORS = {
@@ -101,6 +103,8 @@ class PBNConfig:
     spatial_weight: float = 0.12
     use_minibatch: bool = True
     export_svg: bool = False
+    n_segments_multiplier: int = 40  # Множитель для количества суперпикселей
+    compactness: float = 5.0         # Компактность суперпикселей
     
     @property
     def line_rgb(self) -> Tuple[int, int, int]:
@@ -298,6 +302,7 @@ def remove_thin_regions_scan(quantized: np.ndarray, min_length: int = 7, iterati
                 result = result.transpose(1, 0, 2)
                 h, w = result.shape[:2]  # ✅ ВАЖНО: обновляем h,w после обратного транспонирования
     return result
+
 def merge_regions_rag(quantized: np.ndarray, labels: np.ndarray, 
                       palette: List[Tuple[int,int,int]], 
                       min_area: int, target_regions: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[Tuple[int,int,int]]]:
@@ -704,12 +709,17 @@ def process_image_for_coloring(
     img_lab[:, :, 0] /= 100.0
     img_lab[:, :, 1:] /= 255.0
     
-    n_segments = min(config.n_colors * 40, 1500)
+    # Используем настраиваемые параметры суперпикселей
+    n_segments = min(config.n_colors * config.n_segments_multiplier, 1500)
+    compactness_value = config.compactness
+    
+    logger.info(f"SLIC parameters: n_segments={n_segments}, compactness={compactness_value}")
+    
     segments = slic(
         img_lab,
         n_segments=n_segments,
-        compactness=15.0,
-        sigma=1.5,
+        compactness=compactness_value,
+        sigma=0.5,
         start_label=1,
         enforce_connectivity=True
     )
@@ -785,6 +795,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '<b>Настройки:</b>\n'
         '<code>/colors 16</code> (3-48)\n'
         '<code>/detail 180</code> (50-500)\n'
+        '<code>/size 1200</code> (800-4000)\n'
+        '<code>/segments_multiplier 40</code> (10-100) - кол-во суперпикселей\n'
+        '<code>/compactness 5.0</code> (1-20) - компактность границ\n'
         '<code>/settings</code>',
         parse_mode='HTML'
     )
@@ -796,6 +809,8 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f'🎨 Цветов: {cfg.n_colors}\n'
         f'📏 Мин. область: {cfg.min_region_size}px\n'
         f'🖼️ Размер: {cfg.max_image_size}px\n'
+        f'🔲 Множитель суперпикселей: {cfg.n_segments_multiplier}\n'
+        f'📐 Компактность: {cfg.compactness}\n'
         f'📄 SVG: {"✅" if cfg.export_svg else "❌"}'
     )
     await update.message.reply_text(settings, parse_mode='HTML')
@@ -826,6 +841,8 @@ set_colors = make_setter('n_colors', int, 3, 48, 'Установлено {} цв
 set_detail = make_setter('min_region_size', int, 50, 500, 'Мин. область: {}px')
 set_size = make_setter('max_image_size', int, 800, 4000, 'Макс. размер: {}px')
 set_svg = make_setter('export_svg', lambda x: x.lower() in ['on','true','1'], 0, 1, 'SVG: {}', valid_values=['on','off','true','false','1','0'])
+set_segments_multiplier = make_setter('n_segments_multiplier', int, 10, 100, 'Множитель суперпикселей: {} (всего будет цветов × {})')
+set_compactness = make_setter('compactness', float, 1.0, 20.0, 'Компактность суперпикселей: {} (меньше = точнее границы)')
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
@@ -871,6 +888,8 @@ def main() -> None:
     application.add_handler(CommandHandler('detail', set_detail))
     application.add_handler(CommandHandler('size', set_size))
     application.add_handler(CommandHandler('svg', set_svg))
+    application.add_handler(CommandHandler('segments_multiplier', set_segments_multiplier))
+    application.add_handler(CommandHandler('compactness', set_compactness))
     application.add_handler(CommandHandler('myid', myid))
     application.add_handler(CommandHandler('update', update_bot))
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
