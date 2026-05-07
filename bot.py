@@ -704,7 +704,7 @@ def process_image_for_coloring(
     img_lab[:, :, 0] /= 100.0
     img_lab[:, :, 1:] /= 255.0
     
-    n_segments = min(config.n_colors * 15, 800)
+    n_segments = min(config.n_colors * 30, 1500)
     segments = slic(
         img_lab,
         n_segments=n_segments,
