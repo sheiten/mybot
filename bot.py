@@ -782,8 +782,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '<code>/settings</code> - показать все настройки\n'
         '<code>/myid</code> - показать мой ID\n\n'
         'Или используйте кнопки меню ниже 👇',
-        parse_mode='HTML',
-        reply_markup=reply_markup
     )
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
